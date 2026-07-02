@@ -12,12 +12,12 @@ run-name: >-
 #
 # Fires after CI succeeds on dev, staging, or hotfix — or manually via the
 # Actions tab. Each branch deploys to its OWN directories, taken from that
-# branch's GitHub Environment secrets (never hard-coded):
+# branch's GitHub Environment variables/secrets (never hard-coded):
 #
-#   branch   -> environment -> secrets used
-#   dev      -> dev         -> MVC_DEPLOY_PATH / API_DEPLOY_PATH (+ creds)
-#   staging  -> staging     -> MVC_DEPLOY_PATH / API_DEPLOY_PATH (+ creds)
-#   hotfix   -> hotfix      -> MVC_DEPLOY_PATH / API_DEPLOY_PATH (+ creds)
+#   branch   -> environment -> config used
+#   dev      -> dev         -> vars: MVC_DEPLOY_PATH / API_DEPLOY_PATH  + secrets: creds
+#   staging  -> staging     -> vars: MVC_DEPLOY_PATH / API_DEPLOY_PATH  + secrets: creds
+#   hotfix   -> hotfix      -> vars: MVC_DEPLOY_PATH / API_DEPLOY_PATH  + secrets: creds
 #
 # Change-based deployment:
 #   - only mvc web/**  changed -> deploy Web only
@@ -62,6 +62,14 @@ env:
   API_ARTIFACT: 'app-publish-api'
   DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
   DOTNET_NOLOGO: 'true'
+  # Exclusion lists (files/folders NOT to overwrite or purge on the target) are
+  # read PER APP from GitHub Actions Variables, with the defaults below as a
+  # fallback. Configure them in the UI without editing this file:
+  #   Settings → Secrets and variables → Actions → Variables (repo-wide), or
+  #   Settings → Environments → <env> → Variables (per branch/environment).
+  # Variable names: WEB_EXCLUDE_FILES / WEB_EXCLUDE_DIRS
+  #                 API_EXCLUDE_FILES / API_EXCLUDE_DIRS
+  # Entries may be separated by new lines OR commas; wildcards allowed.
 
 jobs:
   # -------------------------------------------------------------------------
@@ -182,7 +190,7 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 2a. DEPLOY WEB — self-hosted Windows runner. Deploys to the path stored in
-  #     the branch environment's MVC_DEPLOY_PATH secret. Only runs if Web
+  #     the branch environment's MVC_DEPLOY_PATH variable. Only runs if Web
   #     changed. `environment:` also enables optional Approve/Reject gates.
   # -------------------------------------------------------------------------
   deploy-web:
@@ -202,12 +210,14 @@ jobs:
       - name: Deploy MVC
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ secrets.MVC_DEPLOY_PATH }}
+          DEST:            ${{ vars.MVC_DEPLOY_PATH }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.WEB_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.WEB_EXCLUDE_DIRS  || 'uploads' }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "MVC_DEPLOY_PATH secret is not set for this environment." }
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "MVC_DEPLOY_PATH variable is not set for this environment." }
           $source = (Resolve-Path ".\publish\mvc").Path
           $dest   = $env:DEST
 
@@ -221,10 +231,20 @@ jobs:
           }
           try {
             New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            # /MIR mirrors and removes stale files. Add /XF appsettings.Production.json to keep server secrets.
-            robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+
+            # Preserve server-managed files/folders: /XF and /XD exclude them
+            # from BOTH the copy and the /MIR purge, so existing copies survive.
+            # Entries may be separated by new lines, commas, or semicolons.
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+
+            robocopy $source $dest @roboArgs
             if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
-            Write-Host "Deployed Web to $dest"
+            Write-Host "Deployed Web to $dest (preserved: $env:EXCLUDE_FILES $env:EXCLUDE_DIRS)"
           }
           finally {
             if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null }
@@ -233,7 +253,7 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 2b. DEPLOY API — self-hosted Windows runner. Deploys to the branch
-  #     environment's API_DEPLOY_PATH secret. Only runs if the API changed.
+  #     environment's API_DEPLOY_PATH variable. Only runs if the API changed.
   # -------------------------------------------------------------------------
   deploy-api:
     name: Deploy API (${{ needs.detect-changes.outputs.environment }})
@@ -251,12 +271,14 @@ jobs:
       - name: Deploy API
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ secrets.API_DEPLOY_PATH }}
+          DEST:            ${{ vars.API_DEPLOY_PATH }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.API_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.API_EXCLUDE_DIRS  || 'uploads' }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "API_DEPLOY_PATH secret is not set for this environment." }
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "API_DEPLOY_PATH variable is not set for this environment." }
           $source = (Resolve-Path ".\publish\api").Path
           $dest   = $env:DEST
 
@@ -268,9 +290,20 @@ jobs:
           }
           try {
             New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+
+            # Preserve server-managed files/folders: /XF and /XD exclude them
+            # from BOTH the copy and the /MIR purge, so existing copies survive.
+            # Entries may be separated by new lines, commas, or semicolons.
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+
+            robocopy $source $dest @roboArgs
             if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
-            Write-Host "Deployed API to $dest"
+            Write-Host "Deployed API to $dest (preserved: $env:EXCLUDE_FILES $env:EXCLUDE_DIRS)"
           }
           finally {
             if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null }
