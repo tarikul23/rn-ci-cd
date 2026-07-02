@@ -2,16 +2,16 @@ name: CI
 
 # ---------------------------------------------------------------------------
 # Continuous Integration
-# Runs on every push and pull request targeting `main`.
+# Runs on every push and pull request targeting dev, staging, or hotfix.
 # Responsibilities: restore -> build -> test.
 # The CD workflow (cd.yml) is triggered automatically once this succeeds.
 # ---------------------------------------------------------------------------
 
 on:
   push:
-    branches: [main]
+    branches: [dev, staging, hotfix]
   pull_request:
-    branches: [main]
+    branches: [dev, staging, hotfix]
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -21,7 +21,7 @@ concurrency:
 env:
   # Single source of truth for the SDK version. Projects target net10.0.
   DOTNET_VERSION: '10.0.x'
-  # Solution that references both projects (mvc web + web api).
+  # Solution that references all projects (mvc web + web api + Domain).
   SOLUTION: 'rn-ci-cd.sln'
   DOTNET_CONFIGURATION: 'Release'
   # Speed up runs and keep logs clean.
@@ -45,7 +45,7 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      # 3. Cache the NuGet package store keyed on lock/project files
+      # 3. Cache the NuGet package store keyed on project files
       #    so restores are fast on subsequent runs.
       - name: Cache NuGet packages
         uses: actions/cache@v4
@@ -58,7 +58,7 @@ jobs:
       - name: Restore dependencies
         run: dotnet restore "$SOLUTION"
 
-      # 5. Compile the solution (both projects). --no-restore skips a redundant restore.
+      # 5. Compile the solution. --no-restore skips a redundant restore.
       - name: Build
         run: dotnet build "$SOLUTION" --configuration $DOTNET_CONFIGURATION --no-restore
 
