@@ -3,9 +3,15 @@ name: CD
 # ---------------------------------------------------------------------------
 # Continuous Deployment
 # Fires automatically after the CI workflow succeeds on `main`, or manually
-# via the Actions tab (workflow_dispatch) where you can pick a target.
+# via the Actions tab (workflow_dispatch) where you can pick a target project.
 #
-# Flow: publish -> upload artifact -> deploy-linux and/or deploy-windows.
+# Only the projects that actually changed get published and deployed:
+#   - only mvc web/**  changed  -> deploy Web only
+#   - only web api/**  changed  -> deploy API only
+#   - both changed              -> deploy both
+#   - neither changed           -> nothing to deploy (jobs are skipped)
+#
+# Flow: detect-changes -> publish (changed projects) -> deploy-windows.
 # All server credentials come from GitHub Secrets (never hard-coded).
 # ---------------------------------------------------------------------------
 
@@ -15,40 +21,102 @@ on:
     workflows: ["CI"]
     types: [completed]
     branches: [main]
-  # Manual trigger with a deployment-target selector.
+  # Manual trigger: force-deploy a specific project regardless of git diff.
   workflow_dispatch:
     inputs:
-      target:
-        description: 'Deployment target'
+      projects:
+        description: 'Which project(s) to deploy'
         required: true
         default: 'both'
         type: choice
-        options: [linux, windows, both]
+        options: [web, api, both]
 
 concurrency:
   group: cd-${{ github.ref }}
   cancel-in-progress: false   # never interrupt an in-flight deploy
 
 env:
-  DOTNET_VERSION: '10.0.x'     # keep in sync with ci.yml / the projects
+  DOTNET_VERSION: '10.0.x'          # keep in sync with ci.yml / the projects
   DOTNET_CONFIGURATION: 'Release'
   MVC_PROJECT: 'mvc web/DevOps.csproj'
   API_PROJECT: 'web api/web api.csproj'
-  ARTIFACT_NAME: 'app-publish'
+  MVC_ARTIFACT: 'app-publish-mvc'
+  API_ARTIFACT: 'app-publish-api'
   DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
   DOTNET_NOLOGO: 'true'
 
 jobs:
   # -------------------------------------------------------------------------
-  # 1. PUBLISH — produce a deployable build and store it as an artifact.
+  # 0. DETECT CHANGES — decide which projects need deploying.
+  #    * workflow_dispatch  -> honour the operator's `projects` choice.
+  #    * workflow_run (auto) -> diff the pushed commit against its parent.
+  #      Merge/squash commits to main yield the full PR diff via the first
+  #      parent, so PR-based workflows detect all changed files.
   # -------------------------------------------------------------------------
-  publish:
-    name: Publish
+  detect-changes:
+    name: Detect changed projects
     runs-on: ubuntu-latest
-    # Skip if triggered by a CI run that did NOT succeed.
+    # Skip entirely if CI was triggered but did NOT succeed.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
+    outputs:
+      web: ${{ steps.decide.outputs.web }}
+      api: ${{ steps.decide.outputs.api }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          # Full history so we can diff against the parent commit.
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Decide which projects changed
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          web=false
+          api=false
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual run: the operator explicitly chose the target(s).
+            case "${{ github.event.inputs.projects }}" in
+              web)  web=true ;;
+              api)  api=true ;;
+              both) web=true; api=true ;;
+            esac
+          else
+            # Auto run: compare the pushed commit against its first parent.
+            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+            BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo '')"
+
+            if [ -z "$BASE_SHA" ]; then
+              # No parent (very first commit) — deploy everything.
+              web=true; api=true
+            else
+              CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+              echo "Changed files:"
+              echo "$CHANGED"
+              echo "$CHANGED" | grep -q '^mvc web/' && web=true || true
+              echo "$CHANGED" | grep -q '^web api/' && api=true || true
+            fi
+          fi
+
+          echo "web=$web" >> "$GITHUB_OUTPUT"
+          echo "api=$api" >> "$GITHUB_OUTPUT"
+          echo "::notice::Deploy Web=$web  Deploy API=$api"
+
+  # -------------------------------------------------------------------------
+  # 1. PUBLISH — build only the changed projects and store them as artifacts.
+  # -------------------------------------------------------------------------
+  publish:
+    name: Publish
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: >-
+      needs.detect-changes.outputs.web == 'true' ||
+      needs.detect-changes.outputs.api == 'true'
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -58,72 +126,92 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      # Publish each project into its own subfolder of ./publish.
-      # Framework-dependent (the target host has the ASP.NET Core runtime).
+      # Framework-dependent publish (the target host has the ASP.NET runtime).
       - name: Publish MVC app
+        if: needs.detect-changes.outputs.web == 'true'
         run: >-
           dotnet publish "$MVC_PROJECT"
           --configuration $DOTNET_CONFIGURATION
           --output ./publish/mvc
 
       - name: Publish Web API
+        if: needs.detect-changes.outputs.api == 'true'
         run: >-
           dotnet publish "$API_PROJECT"
           --configuration $DOTNET_CONFIGURATION
           --output ./publish/api
 
-      # One artifact containing both apps: publish/mvc and publish/api.
-      - name: Upload build artifact
+      - name: Upload MVC artifact
+        if: needs.detect-changes.outputs.web == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: ./publish
+          name: ${{ env.MVC_ARTIFACT }}
+          path: ./publish/mvc
+          retention-days: 7
+
+      - name: Upload API artifact
+        if: needs.detect-changes.outputs.api == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.API_ARTIFACT }}
+          path: ./publish/api
           retention-days: 7
 
   # -------------------------------------------------------------------------
-  # 2b. DEPLOY TO WINDOWS (IIS) — runs on a SELF-HOSTED runner installed on the
-  #     target machine, so it can write directly to the local IIS site folders.
-  #     Deploys BOTH apps: MVC -> MVC_DEPLOY_PATH, API -> API_DEPLOY_PATH.
+  # 2. DEPLOY TO WINDOWS (IIS) — runs on a SELF-HOSTED runner on the target
+  #    machine. Each project is downloaded and deployed only if it changed.
   # -------------------------------------------------------------------------
   deploy-windows:
     name: Deploy → Windows (IIS, self-hosted)
-    needs: publish
-    # Requires a self-hosted runner registered with these labels on your machine.
+    needs: [detect-changes, publish]
     runs-on: [self-hosted, windows]
     if: >-
-      github.event_name != 'workflow_dispatch' ||
-      contains(fromJSON('["windows","both"]'), github.event.inputs.target)
+      needs.detect-changes.outputs.web == 'true' ||
+      needs.detect-changes.outputs.api == 'true'
     environment: production-windows
     env:
       # Physical paths of the two IIS sites on this machine.
       MVC_DEPLOY_PATH: 'D:\DevOps\test'
       API_DEPLOY_PATH: 'D:\DevOps\api'
     steps:
-      - name: Download build artifact
+      - name: Download MVC artifact
+        if: needs.detect-changes.outputs.web == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.ARTIFACT_NAME }}
-          path: .\publish
+          name: ${{ env.MVC_ARTIFACT }}
+          path: .\publish\mvc
 
-      - name: Deploy to local IIS sites
-        # Override the shell command so the runner's execution policy can't block
-        # the unsigned temp script GitHub generates from this run: block.
+      - name: Download API artifact
+        if: needs.detect-changes.outputs.api == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.API_ARTIFACT }}
+          path: .\publish\api
+
+      # Override the shell command so the runner's execution policy can't block
+      # the unsigned temp script GitHub generates from this run: block.
+      - name: Deploy MVC to IIS
+        if: needs.detect-changes.outputs.web == 'true'
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
+          $source = (Resolve-Path ".\publish\mvc").Path
+          New-Item -ItemType Directory -Force -Path $env:MVC_DEPLOY_PATH | Out-Null
+          # /MIR mirrors and removes stale files. Add /XF appsettings.Production.json to keep server secrets.
+          robocopy $source $env:MVC_DEPLOY_PATH /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+          # robocopy exit codes 0-7 are success; >=8 is a real failure.
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $env:MVC_DEPLOY_PATH with exit code $LASTEXITCODE" }
+          Write-Host "Deployed MVC to $env:MVC_DEPLOY_PATH"
+          exit 0
 
-          function Deploy-App($sourceRel, $dest) {
-            $source = (Resolve-Path $sourceRel).Path
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            # /MIR mirrors and removes stale files. Add /XF appsettings.Production.json to keep server secrets.
-            robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
-            # robocopy exit codes 0-7 are success; >=8 is a real failure.
-            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest with exit code $LASTEXITCODE" }
-            Write-Host "Deployed to $dest"
-          }
-
-          Deploy-App ".\publish\mvc" "$env:MVC_DEPLOY_PATH"
-          Deploy-App ".\publish\api" "$env:API_DEPLOY_PATH"
-
-          # robocopy returns 1-7 on success; normalize so the step doesn't fail.
+      - name: Deploy API to IIS
+        if: needs.detect-changes.outputs.api == 'true'
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = (Resolve-Path ".\publish\api").Path
+          New-Item -ItemType Directory -Force -Path $env:API_DEPLOY_PATH | Out-Null
+          robocopy $source $env:API_DEPLOY_PATH /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $env:API_DEPLOY_PATH with exit code $LASTEXITCODE" }
+          Write-Host "Deployed API to $env:API_DEPLOY_PATH"
           exit 0
