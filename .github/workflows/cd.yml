@@ -94,9 +94,6 @@ jobs:
     env:
       # Physical path of the IIS site on this machine.
       DEPLOY_PATH: 'D:\DevOps\test'
-      # IIS application pool to cycle around the copy. Override via a repo
-      # Variable (Settings → Secrets and variables → Actions → Variables).
-      APP_POOL: ${{ vars.IIS_APP_POOL || 'DevOpsAppPool' }}
     steps:
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -104,39 +101,19 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: .\publish
 
-      # The runner service must run with privileges to manage IIS (Administrator).
       - name: Deploy to local IIS site
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Import-Module WebAdministration
 
           $source = (Resolve-Path .\publish).Path
           $dest   = "$env:DEPLOY_PATH"
-          $pool   = "$env:APP_POOL"
 
-          # 1. Stop the app pool so DLLs/app files aren't locked during the copy.
-          if (Test-Path "IIS:\AppPools\$pool") {
-            if ((Get-WebAppPoolState -Name $pool).Value -ne 'Stopped') {
-              Write-Host "Stopping app pool '$pool'..."
-              Stop-WebAppPool -Name $pool
-              # Wait for it to actually stop before touching files.
-              do { Start-Sleep -Seconds 1 } while ((Get-WebAppPoolState -Name $pool).Value -ne 'Stopped')
-            }
-          } else {
-            Write-Warning "App pool '$pool' not found — skipping stop/start. Set the IIS_APP_POOL variable to enable it."
-          }
-
-          # 2. Mirror the published output into the site folder.
-          #    /MIR removes stale files; keep appsettings if you store secrets there via /XF.
+          # Mirror the published output into the site folder.
+          # /MIR removes stale files; add /XF appsettings.Production.json to keep server secrets.
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
           # robocopy exit codes 0-7 are success; >=8 is a real failure.
           if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
 
-          # 3. Restart the app pool.
-          if (Test-Path "IIS:\AppPools\$pool") {
-            Write-Host "Starting app pool '$pool'..."
-            Start-WebAppPool -Name $pool
-          }
           Write-Host "Deployed to $dest"
