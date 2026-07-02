@@ -30,9 +30,10 @@ concurrency:
   cancel-in-progress: false   # never interrupt an in-flight deploy
 
 env:
-  DOTNET_VERSION: '8.0.x'      # keep in sync with ci.yml / DevOps.csproj
+  DOTNET_VERSION: '10.0.x'     # keep in sync with ci.yml / the projects
   DOTNET_CONFIGURATION: 'Release'
-  PROJECT_PATH: 'DevOps.csproj'
+  MVC_PROJECT: 'mvc web/DevOps.csproj'
+  API_PROJECT: 'web api/web api.csproj'
   ARTIFACT_NAME: 'app-publish'
   DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
   DOTNET_NOLOGO: 'true'
@@ -57,19 +58,21 @@ jobs:
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      - name: Restore
-        run: dotnet restore ${{ env.PROJECT_PATH }}
-
-      # Framework-dependent publish (portable across Windows & Linux since the
-      # target host has the ASP.NET Core runtime installed). For self-contained
-      # deploys add: -r linux-x64 --self-contained true (and a win-x64 variant).
-      - name: Publish
+      # Publish each project into its own subfolder of ./publish.
+      # Framework-dependent (the target host has the ASP.NET Core runtime).
+      - name: Publish MVC app
         run: >-
-          dotnet publish ${{ env.PROJECT_PATH }}
+          dotnet publish "$MVC_PROJECT"
           --configuration $DOTNET_CONFIGURATION
-          --no-restore
-          --output ./publish
+          --output ./publish/mvc
 
+      - name: Publish Web API
+        run: >-
+          dotnet publish "$API_PROJECT"
+          --configuration $DOTNET_CONFIGURATION
+          --output ./publish/api
+
+      # One artifact containing both apps: publish/mvc and publish/api.
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
@@ -79,8 +82,8 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 2b. DEPLOY TO WINDOWS (IIS) — runs on a SELF-HOSTED runner installed on the
-  #     target machine, so it can write directly to the local IIS site folder.
-  #     Flow: stop app pool -> robocopy files into place -> start app pool.
+  #     target machine, so it can write directly to the local IIS site folders.
+  #     Deploys BOTH apps: MVC -> MVC_DEPLOY_PATH, API -> API_DEPLOY_PATH.
   # -------------------------------------------------------------------------
   deploy-windows:
     name: Deploy → Windows (IIS, self-hosted)
@@ -92,8 +95,9 @@ jobs:
       contains(fromJSON('["windows","both"]'), github.event.inputs.target)
     environment: production-windows
     env:
-      # Physical path of the IIS site on this machine.
-      DEPLOY_PATH: 'D:\DevOps\test'
+      # Physical paths of the two IIS sites on this machine.
+      MVC_DEPLOY_PATH: 'D:\DevOps\test'
+      API_DEPLOY_PATH: 'D:\DevOps\api'
     steps:
       - name: Download build artifact
         uses: actions/download-artifact@v4
@@ -101,22 +105,23 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: .\publish
 
-      - name: Deploy to local IIS site
+      - name: Deploy to local IIS sites
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
-          $source = (Resolve-Path .\publish).Path
-          $dest   = "$env:DEPLOY_PATH"
+          function Deploy-App($sourceRel, $dest) {
+            $source = (Resolve-Path $sourceRel).Path
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            # /MIR mirrors and removes stale files. Add /XF appsettings.Production.json to keep server secrets.
+            robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+            # robocopy exit codes 0-7 are success; >=8 is a real failure.
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest with exit code $LASTEXITCODE" }
+            Write-Host "Deployed to $dest"
+          }
 
-          # Mirror the published output into the site folder.
-          # /MIR removes stale files; add /XF appsettings.Production.json to keep server secrets.
-          New-Item -ItemType Directory -Force -Path $dest | Out-Null
-          robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
-          # robocopy exit codes 0-7 are success; >=8 is a real failure.
-          $rc = $LASTEXITCODE
-          if ($rc -ge 8) { throw "robocopy failed with exit code $rc" }
+          Deploy-App ".\publish\mvc" "$env:MVC_DEPLOY_PATH"
+          Deploy-App ".\publish\api" "$env:API_DEPLOY_PATH"
 
-          Write-Host "Deployed to $dest"
           # robocopy returns 1-7 on success; normalize so the step doesn't fail.
           exit 0
