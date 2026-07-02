@@ -11,13 +11,17 @@ run-name: >-
 # Continuous Deployment (multi-branch: dev / staging / hotfix)
 #
 # Fires after CI succeeds on dev, staging, or hotfix — or manually via the
-# Actions tab. Each branch deploys to its OWN directories, taken from that
-# branch's GitHub Environment variables/secrets (never hard-coded):
+# Actions tab. Each app+branch uses its OWN GitHub Environment, so Web and API
+# have SEPARATE Required reviewers (approved independently) and separate
+# variables/secrets (never hard-coded):
 #
-#   branch   -> environment -> config used
-#   dev      -> dev         -> vars: MVC_DEPLOY_PATH / API_DEPLOY_PATH  + secrets: creds
-#   staging  -> staging     -> vars: MVC_DEPLOY_PATH / API_DEPLOY_PATH  + secrets: creds
-#   hotfix   -> hotfix      -> vars: MVC_DEPLOY_PATH / API_DEPLOY_PATH  + secrets: creds
+#   app+branch      -> environment -> config used
+#   web + dev       -> web-dev     -> var: MVC_DEPLOY_PATH  + secrets: creds
+#   api + dev       -> api-dev     -> var: API_DEPLOY_PATH  + secrets: creds
+#   web + staging   -> web-staging -> var: MVC_DEPLOY_PATH  + secrets: creds
+#   api + staging   -> api-staging -> var: API_DEPLOY_PATH  + secrets: creds
+#   web + hotfix    -> web-hotfix  -> var: MVC_DEPLOY_PATH  + secrets: creds
+#   api + hotfix    -> api-hotfix  -> var: API_DEPLOY_PATH  + secrets: creds
 #
 # Change-based deployment:
 #   - only mvc web/**  changed -> deploy Web only
@@ -25,7 +29,9 @@ run-name: >-
 #   - Domain/**        changed -> deploy BOTH (Web + API reference Domain)
 #   - nothing relevant changed -> jobs are skipped
 #
-# Flow: detect-changes -> publish (changed projects) -> deploy-web / deploy-api.
+# Flow (two independent lanes after detect-changes):
+#   detect-changes ─┬─ publish-web ─ deploy-web
+#                   └─ publish-api ─ deploy-api
 # ---------------------------------------------------------------------------
 
 on:
@@ -138,15 +144,14 @@ jobs:
           echo "::notice::branch=$BRANCH  deploy-web=$web  deploy-api=$api"
 
   # -------------------------------------------------------------------------
-  # 1. PUBLISH — build only the changed projects and store them as artifacts.
+  # 1a. PUBLISH WEB — build & package the Web app. Runs only if Web changed.
+  #     Starts the Web lane, independent of the API lane.
   # -------------------------------------------------------------------------
-  publish:
-    name: Publish
+  publish-web:
+    name: Publish Web
     needs: detect-changes
     runs-on: ubuntu-latest
-    if: >-
-      needs.detect-changes.outputs.web == 'true' ||
-      needs.detect-changes.outputs.api == 'true'
+    if: needs.detect-changes.outputs.web == 'true'
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -159,29 +164,45 @@ jobs:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
       - name: Publish MVC app
-        if: needs.detect-changes.outputs.web == 'true'
         run: >-
           dotnet publish "$MVC_PROJECT"
           --configuration $DOTNET_CONFIGURATION
           --output ./publish/mvc
 
-      - name: Publish Web API
-        if: needs.detect-changes.outputs.api == 'true'
-        run: >-
-          dotnet publish "$API_PROJECT"
-          --configuration $DOTNET_CONFIGURATION
-          --output ./publish/api
-
       - name: Upload MVC artifact
-        if: needs.detect-changes.outputs.web == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.MVC_ARTIFACT }}
           path: ./publish/mvc
           retention-days: 7
 
+  # -------------------------------------------------------------------------
+  # 1b. PUBLISH API — build & package the API. Runs only if the API changed.
+  #     Starts the API lane, independent of the Web lane.
+  # -------------------------------------------------------------------------
+  publish-api:
+    name: Publish API
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.api == 'true'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Publish Web API
+        run: >-
+          dotnet publish "$API_PROJECT"
+          --configuration $DOTNET_CONFIGURATION
+          --output ./publish/api
+
       - name: Upload API artifact
-        if: needs.detect-changes.outputs.api == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.API_ARTIFACT }}
@@ -189,16 +210,17 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------
-  # 2a. DEPLOY WEB — self-hosted Windows runner. Deploys to the path stored in
-  #     the branch environment's MVC_DEPLOY_PATH variable. Only runs if Web
-  #     changed. `environment:` also enables optional Approve/Reject gates.
+  # 2a. DEPLOY WEB — self-hosted Windows runner. Uses the app-specific
+  #     environment `web-<branch>` (e.g. web-dev), which holds the Web deploy
+  #     path variable AND its own Required reviewers — so Web is approved
+  #     SEPARATELY from the API. Only runs if Web changed.
   # -------------------------------------------------------------------------
   deploy-web:
     name: Deploy Web (${{ needs.detect-changes.outputs.environment }})
-    needs: [detect-changes, publish]
+    needs: [detect-changes, publish-web]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.web == 'true'
-    environment: ${{ needs.detect-changes.outputs.environment }}
+    environment: web-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download MVC artifact
         uses: actions/download-artifact@v4
@@ -252,15 +274,17 @@ jobs:
           exit 0
 
   # -------------------------------------------------------------------------
-  # 2b. DEPLOY API — self-hosted Windows runner. Deploys to the branch
-  #     environment's API_DEPLOY_PATH variable. Only runs if the API changed.
+  # 2b. DEPLOY API — self-hosted Windows runner. Uses the app-specific
+  #     environment `api-<branch>` (e.g. api-dev), with its own API deploy
+  #     path variable AND its own Required reviewers — approved SEPARATELY
+  #     from the Web app. Only runs if the API changed.
   # -------------------------------------------------------------------------
   deploy-api:
     name: Deploy API (${{ needs.detect-changes.outputs.environment }})
-    needs: [detect-changes, publish]
+    needs: [detect-changes, publish-api]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.api == 'true'
-    environment: ${{ needs.detect-changes.outputs.environment }}
+    environment: api-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download API artifact
         uses: actions/download-artifact@v4
