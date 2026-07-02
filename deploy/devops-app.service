@@ -1,0 +1,23 @@
+# systemd unit for the Linux (Kestrel) deployment.
+# Install on the server at: /etc/systemd/system/devops-app.service
+# Then: sudo systemctl daemon-reload && sudo systemctl enable --now devops-app
+[Unit]
+Description=DevOps ASP.NET Core app
+After=network.target
+
+[Service]
+WorkingDirectory=/var/www/devops-app
+# Runs the framework-dependent DLL. Rename if your assembly differs.
+ExecStart=/usr/bin/dotnet /var/www/devops-app/DevOps.dll
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+SyslogIdentifier=devops-app
+User=www-data
+Environment=ASPNETCORE_ENVIRONMENT=Production
+# Kestrel listens locally; Nginx proxies public traffic to it.
+Environment=ASPNETCORE_URLS=http://127.0.0.1:5000
+Environment=DOTNET_PRINT_TELEMETRY_MESSAGE=false
+
+[Install]
+WantedBy=multi-user.target

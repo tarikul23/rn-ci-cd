@@ -1,0 +1,142 @@
+name: CD
+
+# ---------------------------------------------------------------------------
+# Continuous Deployment
+# Fires automatically after the CI workflow succeeds on `main`, or manually
+# via the Actions tab (workflow_dispatch) where you can pick a target.
+#
+# Flow: publish -> upload artifact -> deploy-linux and/or deploy-windows.
+# All server credentials come from GitHub Secrets (never hard-coded).
+# ---------------------------------------------------------------------------
+
+on:
+  # Run only after CI finished successfully.
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  # Manual trigger with a deployment-target selector.
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Deployment target'
+        required: true
+        default: 'both'
+        type: choice
+        options: [linux, windows, both]
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false   # never interrupt an in-flight deploy
+
+env:
+  DOTNET_VERSION: '8.0.x'      # keep in sync with ci.yml / DevOps.csproj
+  DOTNET_CONFIGURATION: 'Release'
+  PROJECT_PATH: 'DevOps.csproj'
+  ARTIFACT_NAME: 'app-publish'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_NOLOGO: 'true'
+
+jobs:
+  # -------------------------------------------------------------------------
+  # 1. PUBLISH — produce a deployable build and store it as an artifact.
+  # -------------------------------------------------------------------------
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    # Skip if triggered by a CI run that did NOT succeed.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore
+        run: dotnet restore ${{ env.PROJECT_PATH }}
+
+      # Framework-dependent publish (portable across Windows & Linux since the
+      # target host has the ASP.NET Core runtime installed). For self-contained
+      # deploys add: -r linux-x64 --self-contained true (and a win-x64 variant).
+      - name: Publish
+        run: >-
+          dotnet publish ${{ env.PROJECT_PATH }}
+          --configuration $DOTNET_CONFIGURATION
+          --no-restore
+          --output ./publish
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ./publish
+          retention-days: 7
+
+  # -------------------------------------------------------------------------
+  # 2b. DEPLOY TO WINDOWS (IIS) — runs on a SELF-HOSTED runner installed on the
+  #     target machine, so it can write directly to the local IIS site folder.
+  #     Flow: stop app pool -> robocopy files into place -> start app pool.
+  # -------------------------------------------------------------------------
+  deploy-windows:
+    name: Deploy → Windows (IIS, self-hosted)
+    needs: publish
+    # Requires a self-hosted runner registered with these labels on your machine.
+    runs-on: [self-hosted, windows]
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      contains(fromJSON('["windows","both"]'), github.event.inputs.target)
+    environment: production-windows
+    env:
+      # Physical path of the IIS site on this machine.
+      DEPLOY_PATH: 'D:\DevOps\test'
+      # IIS application pool to cycle around the copy. Override via a repo
+      # Variable (Settings → Secrets and variables → Actions → Variables).
+      APP_POOL: ${{ vars.IIS_APP_POOL || 'DevOpsAppPool' }}
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: .\publish
+
+      # The runner service must run with privileges to manage IIS (Administrator).
+      - name: Deploy to local IIS site
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Import-Module WebAdministration
+
+          $source = (Resolve-Path .\publish).Path
+          $dest   = "$env:DEPLOY_PATH"
+          $pool   = "$env:APP_POOL"
+
+          # 1. Stop the app pool so DLLs/app files aren't locked during the copy.
+          if (Test-Path "IIS:\AppPools\$pool") {
+            if ((Get-WebAppPoolState -Name $pool).Value -ne 'Stopped') {
+              Write-Host "Stopping app pool '$pool'..."
+              Stop-WebAppPool -Name $pool
+              # Wait for it to actually stop before touching files.
+              do { Start-Sleep -Seconds 1 } while ((Get-WebAppPoolState -Name $pool).Value -ne 'Stopped')
+            }
+          } else {
+            Write-Warning "App pool '$pool' not found — skipping stop/start. Set the IIS_APP_POOL variable to enable it."
+          }
+
+          # 2. Mirror the published output into the site folder.
+          #    /MIR removes stale files; keep appsettings if you store secrets there via /XF.
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+          # robocopy exit codes 0-7 are success; >=8 is a real failure.
+          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
+
+          # 3. Restart the app pool.
+          if (Test-Path "IIS:\AppPools\$pool") {
+            Write-Host "Starting app pool '$pool'..."
+            Start-WebAppPool -Name $pool
+          }
+          Write-Host "Deployed to $dest"
