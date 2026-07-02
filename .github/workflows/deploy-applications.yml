@@ -1,4 +1,4 @@
-name: CD
+name: Deploy Applications (CD)
 
 # Show the branch + the title/commit that triggered CI (or the actor for a
 # manual run) in the Actions run list. `display_title` carries the PR title or
