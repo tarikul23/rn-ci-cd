@@ -102,7 +102,7 @@ jobs:
           path: .\publish
 
       - name: Deploy to local IIS site
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
 
