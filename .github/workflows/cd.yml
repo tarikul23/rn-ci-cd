@@ -35,11 +35,8 @@ concurrency:
   group: cd-${{ github.ref }}
   cancel-in-progress: false   # never interrupt an in-flight deploy
 
-# The manual-approval gate opens/closes a tracking issue, so the workflow
-# token needs write access to issues.
 permissions:
   contents: read
-  issues: write
 
 env:
   DOTNET_VERSION: '10.0.x'          # keep in sync with ci.yml / the projects
@@ -48,10 +45,6 @@ env:
   API_PROJECT: 'web api/web api.csproj'
   MVC_ARTIFACT: 'app-publish-mvc'
   API_ARTIFACT: 'app-publish-api'
-  # FALLBACK approver list. Normally the `approvers` job resolves this
-  # automatically from the repo's collaborators, so ANY repo user can approve.
-  # This env is only used if that API lookup fails. Keep at least the owner.
-  APPROVERS: 'tarikul23'
   DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
   DOTNET_NOLOGO: 'true'
 
@@ -179,70 +172,18 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------
-  # 2a0. RESOLVE APPROVERS — so ANY user with repo access can approve without
-  #      hand-maintaining a username list. Pulls the repo's collaborators via
-  #      the GitHub API; falls back to the static APPROVERS env if the API
-  #      call is denied (e.g. token lacks collaborator-read on this repo).
-  # -------------------------------------------------------------------------
-  approvers:
-    name: Resolve approvers
-    needs: detect-changes
-    runs-on: ubuntu-latest
-    if: >-
-      needs.detect-changes.outputs.web == 'true' ||
-      needs.detect-changes.outputs.api == 'true'
-    outputs:
-      list: ${{ steps.resolve.outputs.list }}
-    steps:
-      - name: List repository collaborators
-        id: resolve
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Every collaborator (owner + invited users) may approve.
-          users="$(gh api --paginate "repos/${{ github.repository }}/collaborators" \
-                     --jq '.[].login' 2>/dev/null | paste -sd, - || true)"
-          if [ -z "$users" ]; then
-            echo "Could not read collaborators — falling back to APPROVERS env."
-            users="${{ env.APPROVERS }}"
-          fi
-          echo "list=$users" >> "$GITHUB_OUTPUT"
-          echo "::notice::Approvers = $users"
-
-  # -------------------------------------------------------------------------
-  # 2a. APPROVE WEB — manual gate. Opens a tracking issue and pauses until an
-  #     approver comments "approved". Runs on a hosted runner (no need to tie
-  #     up the self-hosted box while waiting). Only fires when Web changed.
-  # -------------------------------------------------------------------------
-  approve-web:
-    name: Approve Web deploy
-    needs: [detect-changes, publish, approvers]
-    runs-on: ubuntu-latest
-    if: needs.detect-changes.outputs.web == 'true'
-    steps:
-      - name: Wait for manual approval
-        uses: trstringer/manual-approval@v1
-        with:
-          secret: ${{ github.TOKEN }}
-          approvers: ${{ needs.approvers.outputs.list }}
-          minimum-approvals: 1
-          issue-title: "Deploy approval required: Web → IIS"
-          issue-body: >-
-            A **Web** deployment is waiting for approval
-            (run ${{ github.run_id }}, commit ${{ github.sha }}).
-            Comment **approved** to deploy, or **denied** to cancel.
-          exclude-workflow-initiator-as-approver: false
-
-  # -------------------------------------------------------------------------
-  # 2b. DEPLOY WEB (IIS) — self-hosted runner on the target machine.
-  #     Runs only after approve-web succeeds. Skipped if Web didn't change.
+  # 2a. DEPLOY WEB (IIS) — self-hosted runner on the target machine.
+  #     Gated by the `production-web` environment. When that environment has
+  #     Required reviewers configured (repo Settings -> Environments), the run
+  #     PAUSES here and shows Approve / Reject buttons; the job only starts
+  #     after a reviewer approves. Skipped entirely if Web didn't change.
   # -------------------------------------------------------------------------
   deploy-web:
     name: Deploy Web → IIS (self-hosted)
-    needs: [detect-changes, publish, approve-web]
+    needs: [detect-changes, publish]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.web == 'true'
+    environment: production-web
     env:
       MVC_DEPLOY_PATH: 'D:\DevOps\test'
     steps:
@@ -268,37 +209,17 @@ jobs:
           exit 0
 
   # -------------------------------------------------------------------------
-  # 2c. APPROVE API — manual gate (its own approvers). Only fires when the
-  #     API changed. A Domain change trips both gates -> two separate issues.
-  # -------------------------------------------------------------------------
-  approve-api:
-    name: Approve API deploy
-    needs: [detect-changes, publish, approvers]
-    runs-on: ubuntu-latest
-    if: needs.detect-changes.outputs.api == 'true'
-    steps:
-      - name: Wait for manual approval
-        uses: trstringer/manual-approval@v1
-        with:
-          secret: ${{ github.TOKEN }}
-          approvers: ${{ needs.approvers.outputs.list }}
-          minimum-approvals: 1
-          issue-title: "Deploy approval required: API → IIS"
-          issue-body: >-
-            An **API** deployment is waiting for approval
-            (run ${{ github.run_id }}, commit ${{ github.sha }}).
-            Comment **approved** to deploy, or **denied** to cancel.
-          exclude-workflow-initiator-as-approver: false
-
-  # -------------------------------------------------------------------------
-  # 2d. DEPLOY API (IIS) — self-hosted runner on the target machine.
-  #     Runs only after approve-api succeeds. Skipped if the API didn't change.
+  # 2b. DEPLOY API (IIS) — self-hosted runner on the target machine.
+  #     Gated by the `production-api` environment (its own reviewers), so the
+  #     run pauses with Approve / Reject buttons before this job starts.
+  #     Skipped if the API didn't change.
   # -------------------------------------------------------------------------
   deploy-api:
     name: Deploy API → IIS (self-hosted)
-    needs: [detect-changes, publish, approve-api]
+    needs: [detect-changes, publish]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.api == 'true'
+    environment: production-api
     env:
       API_DEPLOY_PATH: 'D:\DevOps\api'
     steps:
