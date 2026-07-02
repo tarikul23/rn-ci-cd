@@ -35,15 +35,16 @@ on:
     workflows: ["Build & Test (CI)"]
     types: [completed]
     branches: [dev, staging, hotfix]
-  # Manual trigger: force-deploy specific project(s) on the branch you run it from.
+  # Manual trigger: force-deploy ONE application on the branch you run it from.
+  # Deploy each application separately — run once for web, again for api.
   workflow_dispatch:
     inputs:
-      projects:
-        description: 'Which project(s) to deploy'
+      application:
+        description: 'Application to deploy'
         required: true
-        default: 'both'
+        default: 'web'
         type: choice
-        options: [web, api, both]
+        options: [web, api]
 
 concurrency:
   # One in-flight deploy per branch; never interrupt an active deploy.
@@ -107,11 +108,10 @@ jobs:
           echo "Target branch / environment: $BRANCH"
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual run: operator explicitly chose the project(s).
-            case "${{ github.event.inputs.projects }}" in
-              web)  web=true ;;
-              api)  api=true ;;
-              both) web=true; api=true ;;
+            # Manual run: operator deploys exactly ONE application.
+            case "${{ github.event.inputs.application }}" in
+              web) web=true ;;
+              api) api=true ;;
             esac
           else
             # Auto run: diff the pushed commit against its first parent.
