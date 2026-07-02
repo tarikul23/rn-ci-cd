@@ -1,27 +1,33 @@
 name: CD
 
 # ---------------------------------------------------------------------------
-# Continuous Deployment
-# Fires automatically after the CI workflow succeeds on `main`, or manually
-# via the Actions tab (workflow_dispatch) where you can pick a target project.
+# Continuous Deployment (multi-branch: dev / staging / hotfix)
 #
-# Only the projects that actually changed get published and deployed:
-#   - only mvc web/**  changed  -> deploy Web only
-#   - only web api/**  changed  -> deploy API only
-#   - Domain/**        changed  -> deploy BOTH (Web + API depend on Domain)
-#   - neither changed           -> nothing to deploy (jobs are skipped)
+# Fires after CI succeeds on dev, staging, or hotfix — or manually via the
+# Actions tab. Each branch deploys to its OWN directories, taken from that
+# branch's GitHub Environment secrets (never hard-coded):
 #
-# Flow: detect-changes -> publish (changed projects) -> deploy-windows.
-# All server credentials come from GitHub Secrets (never hard-coded).
+#   branch   -> environment -> secrets used
+#   dev      -> dev         -> MVC_DEPLOY_PATH / API_DEPLOY_PATH (+ creds)
+#   staging  -> staging     -> MVC_DEPLOY_PATH / API_DEPLOY_PATH (+ creds)
+#   hotfix   -> hotfix      -> MVC_DEPLOY_PATH / API_DEPLOY_PATH (+ creds)
+#
+# Change-based deployment:
+#   - only mvc web/**  changed -> deploy Web only
+#   - only web api/**  changed -> deploy API only
+#   - Domain/**        changed -> deploy BOTH (Web + API reference Domain)
+#   - nothing relevant changed -> jobs are skipped
+#
+# Flow: detect-changes -> publish (changed projects) -> deploy-web / deploy-api.
 # ---------------------------------------------------------------------------
 
 on:
-  # Run only after CI finished successfully.
+  # Run only after CI finished successfully on one of these branches.
   workflow_run:
     workflows: ["CI"]
     types: [completed]
-    branches: [main]
-  # Manual trigger: force-deploy a specific project regardless of git diff.
+    branches: [dev, staging, hotfix]
+  # Manual trigger: force-deploy specific project(s) on the branch you run it from.
   workflow_dispatch:
     inputs:
       projects:
@@ -32,8 +38,9 @@ on:
         options: [web, api, both]
 
 concurrency:
-  group: cd-${{ github.ref }}
-  cancel-in-progress: false   # never interrupt an in-flight deploy
+  # One in-flight deploy per branch; never interrupt an active deploy.
+  group: cd-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -50,32 +57,28 @@ env:
 
 jobs:
   # -------------------------------------------------------------------------
-  # 0. DETECT CHANGES — decide which projects need deploying.
-  #    * workflow_dispatch  -> honour the operator's `projects` choice.
-  #    * workflow_run (auto) -> diff the pushed commit against its parent.
-  #      Merge/squash commits to main yield the full PR diff via the first
-  #      parent, so PR-based workflows detect all changed files.
-  #      A change under Domain/ marks BOTH web and api as needing deploy.
+  # 0. DETECT CHANGES + TARGET BRANCH.
+  #    Decides which projects to deploy and which environment (= branch) to
+  #    deploy to. A Domain/** change fans out to BOTH apps.
   # -------------------------------------------------------------------------
   detect-changes:
-    name: Detect changed projects
+    name: Detect changes & target
     runs-on: ubuntu-latest
-    # Skip entirely if CI was triggered but did NOT succeed.
     if: >-
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
     outputs:
       web: ${{ steps.decide.outputs.web }}
       api: ${{ steps.decide.outputs.api }}
+      environment: ${{ steps.decide.outputs.environment }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          # Full history so we can diff against the parent commit.
-          fetch-depth: 0
+          fetch-depth: 0   # full history so we can diff against the parent commit
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
-      - name: Decide which projects changed
+      - name: Decide projects & environment
         id: decide
         shell: bash
         run: |
@@ -83,43 +86,40 @@ jobs:
           web=false
           api=false
 
+          # Branch that triggered CI (auto) or that dispatch was run from (manual).
+          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+          echo "Target branch / environment: $BRANCH"
+
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual run: the operator explicitly chose the target(s).
+            # Manual run: operator explicitly chose the project(s).
             case "${{ github.event.inputs.projects }}" in
               web)  web=true ;;
               api)  api=true ;;
               both) web=true; api=true ;;
             esac
           else
-            # Auto run: compare the pushed commit against its first parent.
+            # Auto run: diff the pushed commit against its first parent.
             HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
             BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo '')"
-
             if [ -z "$BASE_SHA" ]; then
-              # No parent (very first commit) — deploy everything.
-              web=true; api=true
+              web=true; api=true          # no parent (first commit) -> deploy all
             else
               CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-              echo "Changed files:"
-              echo "$CHANGED"
+              echo "Changed files:"; echo "$CHANGED"
 
-              # A change in the shared Domain project fans out to BOTH apps,
-              # since Web and API both depend on it.
+              # Shared Domain project -> redeploy BOTH apps.
               domain=false
               echo "$CHANGED" | grep -q '^Domain/'  && domain=true || true
               echo "$CHANGED" | grep -q '^mvc web/' && web=true    || true
               echo "$CHANGED" | grep -q '^web api/' && api=true    || true
-
-              if [ "$domain" = "true" ]; then
-                web=true
-                api=true
-              fi
+              if [ "$domain" = "true" ]; then web=true; api=true; fi
             fi
           fi
 
-          echo "web=$web" >> "$GITHUB_OUTPUT"
-          echo "api=$api" >> "$GITHUB_OUTPUT"
-          echo "::notice::Deploy Web=$web  Deploy API=$api"
+          echo "web=$web"                 >> "$GITHUB_OUTPUT"
+          echo "api=$api"                 >> "$GITHUB_OUTPUT"
+          echo "environment=$BRANCH"      >> "$GITHUB_OUTPUT"
+          echo "::notice::branch=$BRANCH  deploy-web=$web  deploy-api=$api"
 
   # -------------------------------------------------------------------------
   # 1. PUBLISH — build only the changed projects and store them as artifacts.
@@ -134,13 +134,14 @@ jobs:
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
 
-      # Framework-dependent publish (the target host has the ASP.NET runtime).
       - name: Publish MVC app
         if: needs.detect-changes.outputs.web == 'true'
         run: >-
@@ -172,20 +173,16 @@ jobs:
           retention-days: 7
 
   # -------------------------------------------------------------------------
-  # 2a. DEPLOY WEB (IIS) — self-hosted runner on the target machine.
-  #     Gated by the `production-web` environment. When that environment has
-  #     Required reviewers configured (repo Settings -> Environments), the run
-  #     PAUSES here and shows Approve / Reject buttons; the job only starts
-  #     after a reviewer approves. Skipped entirely if Web didn't change.
+  # 2a. DEPLOY WEB — self-hosted Windows runner. Deploys to the path stored in
+  #     the branch environment's MVC_DEPLOY_PATH secret. Only runs if Web
+  #     changed. `environment:` also enables optional Approve/Reject gates.
   # -------------------------------------------------------------------------
   deploy-web:
-    name: Deploy Web → IIS (self-hosted)
+    name: Deploy Web (${{ needs.detect-changes.outputs.environment }})
     needs: [detect-changes, publish]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.web == 'true'
-    environment: production-web
-    env:
-      MVC_DEPLOY_PATH: 'D:\DevOps\test'
+    environment: ${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download MVC artifact
         uses: actions/download-artifact@v4
@@ -193,35 +190,49 @@ jobs:
           name: ${{ env.MVC_ARTIFACT }}
           path: .\publish\mvc
 
-      # Override the shell command so the runner's execution policy can't block
-      # the unsigned temp script GitHub generates from this run: block.
-      - name: Deploy MVC to IIS
+      # Execution-policy override so the runner can't block the temp script.
+      - name: Deploy MVC
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ secrets.MVC_DEPLOY_PATH }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "MVC_DEPLOY_PATH secret is not set for this environment." }
           $source = (Resolve-Path ".\publish\mvc").Path
-          New-Item -ItemType Directory -Force -Path $env:MVC_DEPLOY_PATH | Out-Null
-          # /MIR mirrors and removes stale files. Add /XF appsettings.Production.json to keep server secrets.
-          robocopy $source $env:MVC_DEPLOY_PATH /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
-          # robocopy exit codes 0-7 are success; >=8 is a real failure.
-          if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $env:MVC_DEPLOY_PATH with exit code $LASTEXITCODE" }
-          Write-Host "Deployed MVC to $env:MVC_DEPLOY_PATH"
+          $dest   = $env:DEST
+
+          # If the target is a remote UNC share and credentials are provided,
+          # authenticate to it first (local D:\ paths skip this).
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\')
+            $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            # /MIR mirrors and removes stale files. Add /XF appsettings.Production.json to keep server secrets.
+            robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+            Write-Host "Deployed Web to $dest"
+          }
+          finally {
+            if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null }
+          }
           exit 0
 
   # -------------------------------------------------------------------------
-  # 2b. DEPLOY API (IIS) — self-hosted runner on the target machine.
-  #     Gated by the `production-api` environment (its own reviewers), so the
-  #     run pauses with Approve / Reject buttons before this job starts.
-  #     Skipped if the API didn't change.
+  # 2b. DEPLOY API — self-hosted Windows runner. Deploys to the branch
+  #     environment's API_DEPLOY_PATH secret. Only runs if the API changed.
   # -------------------------------------------------------------------------
   deploy-api:
-    name: Deploy API → IIS (self-hosted)
+    name: Deploy API (${{ needs.detect-changes.outputs.environment }})
     needs: [detect-changes, publish]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.api == 'true'
-    environment: production-api
-    env:
-      API_DEPLOY_PATH: 'D:\DevOps\api'
+    environment: ${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download API artifact
         uses: actions/download-artifact@v4
@@ -229,13 +240,31 @@ jobs:
           name: ${{ env.API_ARTIFACT }}
           path: .\publish\api
 
-      - name: Deploy API to IIS
+      - name: Deploy API
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ secrets.API_DEPLOY_PATH }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "API_DEPLOY_PATH secret is not set for this environment." }
           $source = (Resolve-Path ".\publish\api").Path
-          New-Item -ItemType Directory -Force -Path $env:API_DEPLOY_PATH | Out-Null
-          robocopy $source $env:API_DEPLOY_PATH /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
-          if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $env:API_DEPLOY_PATH with exit code $LASTEXITCODE" }
-          Write-Host "Deployed API to $env:API_DEPLOY_PATH"
+          $dest   = $env:DEST
+
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\')
+            $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+            Write-Host "Deployed API to $dest"
+          }
+          finally {
+            if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null }
+          }
           exit 0
