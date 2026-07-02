@@ -1,4 +1,11 @@
-name: CD
+name: Deploy Applications (CD)
+
+# Show the branch + the title/commit that triggered CI (or the actor for a
+# manual run) in the Actions run list. `display_title` carries the PR title or
+# commit message from the CI run through to CD.
+run-name: >-
+  CD → ${{ github.event.workflow_run.head_branch || github.ref_name }}:
+  ${{ github.event.workflow_run.display_title || format('manual by {0}', github.actor) }}
 
 # ---------------------------------------------------------------------------
 # Continuous Deployment (multi-branch: dev / staging / hotfix)
