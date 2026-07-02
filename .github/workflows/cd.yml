@@ -106,7 +106,9 @@ jobs:
           path: .\publish
 
       - name: Deploy to local IIS sites
-        shell: powershell
+        # Override the shell command so the runner's execution policy can't block
+        # the unsigned temp script GitHub generates from this run: block.
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         run: |
           $ErrorActionPreference = 'Stop'
 
