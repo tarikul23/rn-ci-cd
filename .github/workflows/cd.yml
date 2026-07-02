@@ -114,6 +114,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           robocopy $source $dest /MIR /NFL /NDL /NJH /NJS /NP /R:3 /W:5
           # robocopy exit codes 0-7 are success; >=8 is a real failure.
-          if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
+          $rc = $LASTEXITCODE
+          if ($rc -ge 8) { throw "robocopy failed with exit code $rc" }
 
           Write-Host "Deployed to $dest"
+          # robocopy returns 1-7 on success; normalize so the step doesn't fail.
+          exit 0
