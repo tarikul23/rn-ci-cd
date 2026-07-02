@@ -30,8 +30,9 @@ run-name: >-
 
 on:
   # Run only after CI finished successfully on one of these branches.
+  # NOTE: this must match the CI workflow's `name:` exactly.
   workflow_run:
-    workflows: ["CI"]
+    workflows: ["Build & Test (CI)"]
     types: [completed]
     branches: [dev, staging, hotfix]
   # Manual trigger: force-deploy specific project(s) on the branch you run it from.
