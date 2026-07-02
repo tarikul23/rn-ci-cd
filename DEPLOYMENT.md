@@ -5,8 +5,8 @@ workflows in [`.github/workflows`](.github/workflows):
 
 | Workflow | File | Purpose |
 | --- | --- | --- |
-| CI | `ci.yml` | Restore → build → test on every push/PR to `dev`, `staging`, `hotfix`. |
-| CD | `cd.yml` | Publishes and deploys the changed app(s) after CI succeeds. |
+| Build & Test (CI) | `build-and-test.yml` | Restore → build → test on every push/PR to `dev`, `staging`, `hotfix`. |
+| Deploy Applications (CD) | `deploy-applications.yml` | Publishes and deploys the changed app(s) after CI succeeds. |
 
 The solution contains three projects:
 
@@ -20,7 +20,7 @@ The solution contains three projects:
 
 ## How deployment decides what to deploy
 
-`cd.yml` diffs the pushed commit against its parent and deploys only what changed:
+`deploy-applications.yml` diffs the pushed commit against its parent and deploys only what changed:
 
 | Changed paths | Web deployed? | API deployed? |
 | --- | --- | --- |
@@ -98,7 +98,7 @@ the deploy shares). It needs:
 
 > `robocopy /MIR` removes files at the destination that no longer exist in the
 > build. To preserve server-only files (e.g. `appsettings.Production.json`),
-> add `/XF appsettings.Production.json` to the `robocopy` line in `cd.yml`.
+> add `/XF appsettings.Production.json` to the `robocopy` line in `deploy-applications.yml`.
 
 ---
 
