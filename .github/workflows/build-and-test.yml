@@ -25,8 +25,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Single source of truth for the SDK version. Projects target net10.0.
-  DOTNET_VERSION: '10.0.x'
+  # SDKs: Web + API target net10.0; SSO + WindowsService target net8.0.
+  DOTNET_VERSION: |
+    8.0.x
+    10.0.x
   # Solution that references all projects (Web + API + Domain).
   SOLUTION_FILE: 'rn-ci-cd.sln'
   BUILD_CONFIGURATION: 'Release'
