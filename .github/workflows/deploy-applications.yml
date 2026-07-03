@@ -17,17 +17,19 @@ run-name: >-
 #
 # A change in the shared Domain project redeploys ALL four apps.
 #
-# Each app+branch uses its OWN GitHub Environment, so every app is approved
-# and configured SEPARATELY:
+# Each app+branch uses its OWN GitHub Environment (reviewers + deploy-path
+# variable), and the environment is attached to the PUBLISH job — so a
+# reviewer approves BEFORE the build runs. The deploy job then reads the path
+# from the publish job's output and credentials from repository secrets.
 #   web-dev  api-dev  sso-dev  svc-dev
 #   web-staging  api-staging  sso-staging  svc-staging
 #   web-hotfix   api-hotfix   sso-hotfix   svc-hotfix
 #
-# Flow (four independent lanes after detect-changes):
-#   detect-changes ─┬─ publish-web ─ deploy-web   (Dashboard Web)
-#                   ├─ publish-api ─ deploy-api   (MJH API)
-#                   ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
-#                   └─ publish-svc ─ deploy-svc   (Windows Service)
+# Flow (four independent lanes; [approve] gates BEFORE publish):
+#   detect-changes ─┬─ [approve] publish-web ─ deploy-web   (Dashboard Web)
+#                   ├─ [approve] publish-api ─ deploy-api   (MJH API)
+#                   ├─ [approve] publish-sso ─ deploy-sso   (Dashboard SSO)
+#                   └─ [approve] publish-svc ─ deploy-svc   (Windows Service)
 # ---------------------------------------------------------------------------
 
 on:
@@ -157,7 +159,14 @@ jobs:
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.web == 'true'
+    # Approval gate: reviewers on this environment sign off BEFORE the build.
+    environment: web-${{ needs.detect-changes.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
     steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: echo "deploy_path=${{ vars.WEB_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -180,7 +189,13 @@ jobs:
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.api == 'true'
+    environment: api-${{ needs.detect-changes.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
     steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: echo "deploy_path=${{ vars.API_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -203,7 +218,13 @@ jobs:
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.sso == 'true'
+    environment: sso-${{ needs.detect-changes.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
     steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: echo "deploy_path=${{ vars.SSO_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -226,7 +247,16 @@ jobs:
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.svc == 'true'
+    environment: svc-${{ needs.detect-changes.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
+      service_name: ${{ steps.cfg.outputs.service_name }}
     steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: |
+          echo "deploy_path=${{ vars.SVC_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
+          echo "service_name=${{ vars.SVC_SERVICE_NAME }}" >> "$GITHUB_OUTPUT"
       - name: Checkout source
         uses: actions/checkout@v4
         with:
@@ -245,14 +275,14 @@ jobs:
           retention-days: 7
 
   # =========================================================================
-  # DEPLOY LANES — self-hosted Windows runner. Each app uses its own
-  # environment (app-branch), so it is approved and configured separately.
+  # DEPLOY LANES — self-hosted Windows runner. Approval already happened at the
+  # publish stage; the deploy path comes from that job's output, credentials
+  # from repository secrets.
   # =========================================================================
   deploy-web:
     name: Deploy Web (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-web]
     runs-on: [self-hosted, windows]
-    environment: web-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -262,7 +292,7 @@ jobs:
       - name: Deploy Dashboard Web
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ vars.WEB_DEPLOY_PATH }}
+          DEST:            ${{ needs.publish-web.outputs.deploy_path }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.WEB_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
@@ -295,7 +325,6 @@ jobs:
     name: Deploy API (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-api]
     runs-on: [self-hosted, windows]
-    environment: api-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -305,7 +334,7 @@ jobs:
       - name: Deploy MJH API
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ vars.API_DEPLOY_PATH }}
+          DEST:            ${{ needs.publish-api.outputs.deploy_path }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.API_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
@@ -338,7 +367,6 @@ jobs:
     name: Deploy SSO (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-sso]
     runs-on: [self-hosted, windows]
-    environment: sso-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -348,7 +376,7 @@ jobs:
       - name: Deploy Dashboard SSO
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ vars.SSO_DEPLOY_PATH }}
+          DEST:            ${{ needs.publish-sso.outputs.deploy_path }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.SSO_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
@@ -383,7 +411,6 @@ jobs:
     name: Deploy SVC (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-svc]
     runs-on: [self-hosted, windows]
-    environment: svc-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -393,8 +420,8 @@ jobs:
       - name: Deploy Windows Service
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ vars.SVC_DEPLOY_PATH }}
-          SERVICE_NAME:    ${{ vars.SVC_SERVICE_NAME }}
+          DEST:            ${{ needs.publish-svc.outputs.deploy_path }}
+          SERVICE_NAME:    ${{ needs.publish-svc.outputs.service_name }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.SVC_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
