@@ -1,36 +1,44 @@
 # Deployment Guide
 
-CI/CD for this ASP.NET Core solution is driven by two GitHub Actions
-workflows in [`.github/workflows`](.github/workflows):
+CI/CD for this ASP.NET Core solution is driven by GitHub Actions workflows in
+[`.github/workflows`](.github/workflows):
 
 | Workflow | File | Purpose |
 | --- | --- | --- |
-| Build & Test (CI) | `build-and-test.yml` | Restore → build → test on every push/PR to `dev`, `staging`, `hotfix`. |
-| Deploy Applications (CD) | `deploy-applications.yml` | Publishes and deploys the changed app(s) after CI succeeds. |
+| Build & Test (CI) | `build-and-test.yml` | Restore → build → test the whole solution on every push/PR to `dev`, `staging`, `hotfix`. |
+| Deploy Applications (CD) | `deploy-applications.yml` | Publishes and deploys the changed application(s) after CI succeeds. |
+| Provision Deploy Environments | `setup-environments.yml` | One-time: creates the 12 environments and their variables/secrets. |
 
-The solution contains three projects:
+## Applications
 
-| Project | Path | Deployed as |
+The solution contains four deployable applications plus a shared library:
+
+| Application | Project | Deploy job / lane |
 | --- | --- | --- |
-| Web (MVC) | `mvc web/DevOps.csproj` | Web app |
-| API | `web api/web api.csproj` | API app |
-| Domain | `Domain/Domain.csproj` | Shared library (referenced by Web **and** API) |
+| **Dashboard Web** | `mvc web/DevOps.csproj` | `deploy-web` |
+| **MJH API** | `web api/web api.csproj` | `deploy-api` |
+| **Dashboard SSO** | `SSO/SSO.csproj` | `deploy-sso` |
+| **Windows Service** | `WindowsService/WindowsService.csproj` | `deploy-svc` |
+| Domain (shared) | `Domain/Domain.csproj` | — (library; a change fans out to all four) |
 
 ---
 
 ## How deployment decides what to deploy
 
-`deploy-applications.yml` diffs the pushed commit against its parent and deploys only what changed:
+`deploy-applications.yml` diffs the pushed commit against its parent and deploys
+only the applications whose files changed:
 
-| Changed paths | Web deployed? | API deployed? |
-| --- | --- | --- |
-| `mvc web/**` only | ✅ | — |
-| `web api/**` only | — | ✅ |
-| `Domain/**` (any) | ✅ | ✅ |
-| Domain + one app | ✅ | ✅ |
-| none of the above | — | — |
+| Changed paths | Web | API | SSO | Service |
+| --- | --- | --- | --- | --- |
+| `mvc web/**` | ✅ | — | — | — |
+| `web api/**` | — | ✅ | — | — |
+| `SSO/**` | — | — | ✅ | — |
+| `WindowsService/**` | — | — | — | ✅ |
+| `Domain/**` (any) | ✅ | ✅ | ✅ | ✅ |
+| none of the above | — | — | — | — |
 
-A change in **Domain** redeploys **both** apps because they reference it.
+A change in **Domain** redeploys **all four** applications, since it is the
+shared layer they build on.
 
 > Detection uses a first-parent diff (`HEAD^..HEAD`). Merge/squash commits into
 > a branch capture the full diff; a direct multi-commit push only diffs the last
@@ -38,50 +46,103 @@ A change in **Domain** redeploys **both** apps because they reference it.
 
 ---
 
-## Branches, environments, and directories
+## Pipeline flow
 
-Each branch deploys to its **own directories**, driven by a matching GitHub
-**Environment** of the same name. The deploy job sets
-`environment: <branch>`, so the same secret name resolves to that branch's
-value.
+Four independent lanes run after change detection, so a failure or approval in
+one application never blocks another:
 
-| Branch | Environment | Deploy target |
-| --- | --- | --- |
-| `dev` | `dev` | dev directories |
-| `staging` | `staging` | staging directories |
-| `hotfix` | `hotfix` | hotfix directories |
+```
+detect-changes ─┬─ publish-web ─ deploy-web   (Dashboard Web)
+                ├─ publish-api ─ deploy-api   (MJH API)
+                ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
+                └─ publish-svc ─ deploy-svc   (Windows Service)
+```
 
 ---
 
-## Required GitHub Environments & secrets
+## Branches, environments, and directories
 
-Create the environments under **Settings → Environments**, then add these
-**environment secrets** to *each* one (`dev`, `staging`, `hotfix`).
+Each **application + branch** pair uses its own GitHub **Environment**, so every
+application is configured and approved separately. The deploy job sets
+`environment: <app>-<branch>`, and reads that environment's deploy-path
+**variable**.
 
-| Secret | Required | Description | Example |
+| App \ Branch | `dev` | `staging` | `hotfix` |
 | --- | --- | --- | --- |
-| `MVC_DEPLOY_PATH` | ✅ | Destination directory for the Web app. Local path or UNC share. | `D:\DevOps\dev\web` |
-| `API_DEPLOY_PATH` | ✅ | Destination directory for the API app. | `D:\DevOps\dev\api` |
-| `DEPLOY_USER` | ⚠️ Remote only | Username used to authenticate to a remote UNC share. | `DOMAIN\deployer` |
-| `DEPLOY_PASSWORD` | ⚠️ Remote only | Password for `DEPLOY_USER`. | *(secret)* |
+| Dashboard Web | `web-dev` | `web-staging` | `web-hotfix` |
+| MJH API | `api-dev` | `api-staging` | `api-hotfix` |
+| Dashboard SSO | `sso-dev` | `sso-staging` | `sso-hotfix` |
+| Windows Service | `svc-dev` | `svc-staging` | `svc-hotfix` |
 
-Example values per environment:
+That is **12 environments** total.
 
-| Secret | `dev` | `staging` | `hotfix` |
-| --- | --- | --- | --- |
-| `MVC_DEPLOY_PATH` | `D:\DevOps\dev\web` | `D:\DevOps\staging\web` | `D:\DevOps\hotfix\web` |
-| `API_DEPLOY_PATH` | `D:\DevOps\dev\api` | `D:\DevOps\staging\api` | `D:\DevOps\hotfix\api` |
+---
+
+## Required environment configuration
+
+Create the 12 environments under **Settings → Environments** (or run the
+`setup-environments.yml` workflow). Each environment needs the config below.
+
+### Variables (non-sensitive — Variables tab)
+
+Each environment holds **one** deploy-path variable, named for its application:
+
+| Environment prefix | Variable | Example (`dev`) |
+| --- | --- | --- |
+| `web-*` | `WEB_DEPLOY_PATH` | `D:\DevOps\dev\web` |
+| `api-*` | `API_DEPLOY_PATH` | `D:\DevOps\dev\api` |
+| `sso-*` | `SSO_DEPLOY_PATH` | `D:\DevOps\dev\sso` |
+| `svc-*` | `SVC_DEPLOY_PATH` | `D:\DevOps\dev\svc` |
+
+Optional per-environment variables:
+
+| Variable | Applies to | Description |
+| --- | --- | --- |
+| `SVC_SERVICE_NAME` | `svc-*` | Name of the Windows Service to stop before copy and start after. Required for the service deploy to swap locked binaries. |
+| `WEB_EXCLUDE_FILES` / `WEB_EXCLUDE_DIRS` | `web-*` | Files/folders to preserve on the target (see below). Also `API_`, `SSO_`, `SVC_` variants. |
+
+### Secrets (sensitive — Secrets tab)
+
+Only needed when deploying to a **remote UNC share**; leave unset for local
+`D:\` paths on the runner.
+
+| Secret | Description | Example |
+| --- | --- | --- |
+| `DEPLOY_USER` | Username to authenticate to a remote UNC share. | `DOMAIN\deployer` |
+| `DEPLOY_PASSWORD` | Password for `DEPLOY_USER`. | *(secret)* |
+
+> **Deploy paths are Variables, not Secrets** — they are configuration, not
+> sensitive data, so they are visible in logs. Credentials stay as Secrets.
 
 ### Local vs. remote targets
 
 - **Local path** (`D:\...`): the self-hosted runner writes directly to disk.
   Leave `DEPLOY_USER` / `DEPLOY_PASSWORD` unset.
 - **Remote UNC share** (`\\server\share\...`): set `DEPLOY_USER` and
-  `DEPLOY_PASSWORD`. The deploy script runs `net use` to authenticate to the
-  share before `robocopy`, then disconnects afterwards.
+  `DEPLOY_PASSWORD`. The deploy script runs `net use` to authenticate before
+  `robocopy`, then disconnects afterwards.
 
-Nothing (paths or credentials) is hard-coded in the workflow — all of it comes
-from environment secrets.
+---
+
+## Preserving server-managed files & folders
+
+Deployment mirrors the build with `robocopy /MIR`, which deletes anything at the
+target not present in the build. Files/folders that must survive (e.g.
+`appsettings.json`, an `uploads` directory) are excluded per application via
+environment variables — entries separated by new lines, commas, or semicolons;
+robocopy wildcards allowed:
+
+| Variable | Default |
+| --- | --- |
+| `WEB_EXCLUDE_FILES` / `API_EXCLUDE_FILES` / `SSO_EXCLUDE_FILES` / `SVC_EXCLUDE_FILES` | `appsettings.json, appsettings.*.json` |
+| `WEB_EXCLUDE_DIRS` / `API_EXCLUDE_DIRS` / `SSO_EXCLUDE_DIRS` | `uploads` |
+| `SVC_EXCLUDE_DIRS` | *(empty)* |
+
+Excluded items are skipped in both the copy and the `/MIR` purge, so existing
+server copies are never overwritten or deleted.
+
+> First deploy: because `appsettings.json` is excluded from copying, place the
+> production config on the target once, manually — deployments won't clobber it.
 
 ---
 
@@ -91,39 +152,48 @@ Deployment jobs run on a **self-hosted Windows runner** labelled
 `self-hosted, windows`, installed on the target machine (or one with access to
 the deploy shares). It needs:
 
-- The **.NET runtime** matching the app (publish is framework-dependent).
+- The **.NET runtime** matching the apps (publish is framework-dependent).
 - Write access to the deploy directories / shares.
-- IIS sites pointed at the deploy directories (deployment mirrors files with
-  `robocopy /MIR`).
-
-> `robocopy /MIR` removes files at the destination that no longer exist in the
-> build. To preserve server-only files (e.g. `appsettings.Production.json`),
-> add `/XF appsettings.Production.json` to the `robocopy` line in `deploy-applications.yml`.
+- IIS sites pointed at the `web-*`, `api-*`, `sso-*` directories.
+- Permission to **stop/start the Windows Service** named in `SVC_SERVICE_NAME`.
 
 ---
 
-## Optional: approval gates (Approve / Reject buttons)
+## Approval gates (Approve / Reject buttons)
 
-Because each deploy job targets a GitHub Environment, you can add manual
-approval per branch:
+Because each deploy job targets its own environment, every application is
+approved **separately**:
 
-1. **Settings → Environments →** pick an environment (e.g. `staging`).
+1. **Settings → Environments →** pick an environment (e.g. `api-staging`).
 2. Enable **Required reviewers** and add at least one reviewer, then **Save**.
    (The Save button stays disabled until a reviewer is added.)
 3. Optionally set a **Wait timer** and a **Deployment branch rule**.
 
-The run then pauses with **Approve and deploy / Reject** buttons before the
-deploy job starts.
+The run then pauses with **Approve and deploy / Reject** buttons before that
+application's deploy job starts. Deploying to `dev` with several apps changed
+raises one approval per app (`web-dev`, `api-dev`, …), each owned independently.
 
 > Required reviewers on **private** repositories need a paid plan
-> (GitHub Pro / Team / Enterprise). Environment **secrets** work on all plans.
+> (GitHub Pro / Team / Enterprise). Environment **variables and secrets** work
+> on all plans.
 
 ---
 
 ## Triggering a deployment
 
 - **Automatic:** push (or merge) to `dev`, `staging`, or `hotfix`. CI runs; on
-  success CD deploys the changed app(s) to that branch's directories.
-- **Manual:** **Actions → CD → Run workflow**, choose the branch, and pick
-  `web`, `api`, or `both`. This force-deploys the selected project(s) to the
-  chosen branch's environment regardless of the git diff.
+  success CD deploys each changed application to that branch's environment(s).
+- **Manual:** **Actions → Deploy Applications (CD) → Run workflow**, choose the
+  branch, and pick **one** application (`dashboard-web`, `mjh-api`,
+  `dashboard-sso`, or `windows-service`). It force-deploys that single
+  application to the chosen branch's environment, regardless of the git diff.
+  Run it again to deploy another application.
+
+---
+
+## Note on `workflow_run` and the default branch
+
+CD triggers via `workflow_run` after CI. GitHub only evaluates that trigger from
+the workflow file on the **default branch (`main`)**. The workflows must be
+present on `main` for automatic deployment to fire, even though the apps deploy
+from `dev` / `staging` / `hotfix`.

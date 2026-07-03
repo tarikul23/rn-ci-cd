@@ -1,8 +1,7 @@
 name: Deploy Applications (CD)
 
 # Show the branch + the title/commit that triggered CI (or the actor for a
-# manual run) in the Actions run list. `display_title` carries the PR title or
-# commit message from the CI run through to CD.
+# manual run) in the Actions run list.
 run-name: >-
   CD → ${{ github.event.workflow_run.head_branch || github.ref_name }}:
   ${{ github.event.workflow_run.display_title || format('manual by {0}', github.actor) }}
@@ -10,28 +9,25 @@ run-name: >-
 # ---------------------------------------------------------------------------
 # Continuous Deployment (multi-branch: dev / staging / hotfix)
 #
-# Fires after CI succeeds on dev, staging, or hotfix — or manually via the
-# Actions tab. Each app+branch uses its OWN GitHub Environment, so Web and API
-# have SEPARATE Required reviewers (approved independently) and separate
-# variables/secrets (never hard-coded):
+# Deploys four applications, each only when it changed:
+#   Dashboard Web    (mvc web/)          -> vars.WEB_DEPLOY_PATH
+#   MJH API          (web api/)          -> vars.API_DEPLOY_PATH
+#   Dashboard SSO    (SSO/)              -> vars.SSO_DEPLOY_PATH
+#   Windows Service  (WindowsService/)   -> vars.SVC_DEPLOY_PATH
 #
-#   app+branch      -> environment -> config used
-#   web + dev       -> web-dev     -> var: MVC_DEPLOY_PATH  + secrets: creds
-#   api + dev       -> api-dev     -> var: API_DEPLOY_PATH  + secrets: creds
-#   web + staging   -> web-staging -> var: MVC_DEPLOY_PATH  + secrets: creds
-#   api + staging   -> api-staging -> var: API_DEPLOY_PATH  + secrets: creds
-#   web + hotfix    -> web-hotfix  -> var: MVC_DEPLOY_PATH  + secrets: creds
-#   api + hotfix    -> api-hotfix  -> var: API_DEPLOY_PATH  + secrets: creds
+# A change in the shared Domain project redeploys ALL four apps.
 #
-# Change-based deployment:
-#   - only mvc web/**  changed -> deploy Web only
-#   - only web api/**  changed -> deploy API only
-#   - Domain/**        changed -> deploy BOTH (Web + API reference Domain)
-#   - nothing relevant changed -> jobs are skipped
+# Each app+branch uses its OWN GitHub Environment, so every app is approved
+# and configured SEPARATELY:
+#   web-dev  api-dev  sso-dev  svc-dev
+#   web-staging  api-staging  sso-staging  svc-staging
+#   web-hotfix   api-hotfix   sso-hotfix   svc-hotfix
 #
-# Flow (two independent lanes after detect-changes):
-#   detect-changes ─┬─ publish-web ─ deploy-web
-#                   └─ publish-api ─ deploy-api
+# Flow (four independent lanes after detect-changes):
+#   detect-changes ─┬─ publish-web ─ deploy-web   (Dashboard Web)
+#                   ├─ publish-api ─ deploy-api   (MJH API)
+#                   ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
+#                   └─ publish-svc ─ deploy-svc   (Windows Service)
 # ---------------------------------------------------------------------------
 
 on:
@@ -42,15 +38,14 @@ on:
     types: [completed]
     branches: [dev, staging, hotfix]
   # Manual trigger: force-deploy ONE application on the branch you run it from.
-  # Deploy each application separately — run once for web, again for api.
   workflow_dispatch:
     inputs:
       application:
         description: 'Application to deploy'
         required: true
-        default: 'web'
+        default: 'dashboard-web'
         type: choice
-        options: [web, api]
+        options: [dashboard-web, mjh-api, dashboard-sso, windows-service]
 
 concurrency:
   # One in-flight deploy per branch; never interrupt an active deploy.
@@ -63,26 +58,24 @@ permissions:
 env:
   DOTNET_VERSION: '10.0.x'          # keep in sync with build-and-test.yml / the projects
   DOTNET_CONFIGURATION: 'Release'
-  MVC_PROJECT: 'mvc web/DevOps.csproj'
+  # Project files (source of each application).
+  WEB_PROJECT: 'mvc web/DevOps.csproj'
   API_PROJECT: 'web api/web api.csproj'
-  MVC_ARTIFACT: 'app-publish-mvc'
-  API_ARTIFACT: 'app-publish-api'
+  SSO_PROJECT: 'SSO/SSO.csproj'
+  SVC_PROJECT: 'WindowsService/WindowsService.csproj'
+  # Build artifact names (one per application).
+  WEB_ARTIFACT: 'dashboard-web'
+  API_ARTIFACT: 'mjh-api'
+  SSO_ARTIFACT: 'dashboard-sso'
+  SVC_ARTIFACT: 'windows-service'
   DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
   DOTNET_NOLOGO: 'true'
-  # Exclusion lists (files/folders NOT to overwrite or purge on the target) are
-  # read PER APP from GitHub Actions Variables, with the defaults below as a
-  # fallback. Configure them in the UI without editing this file:
-  #   Settings → Secrets and variables → Actions → Variables (repo-wide), or
-  #   Settings → Environments → <env> → Variables (per branch/environment).
-  # Variable names: WEB_EXCLUDE_FILES / WEB_EXCLUDE_DIRS
-  #                 API_EXCLUDE_FILES / API_EXCLUDE_DIRS
-  # Entries may be separated by new lines OR commas; wildcards allowed.
 
 jobs:
   # -------------------------------------------------------------------------
   # 0. DETECT CHANGES + TARGET BRANCH.
-  #    Decides which projects to deploy and which environment (= branch) to
-  #    deploy to. A Domain/** change fans out to BOTH apps.
+  #    Sets a deploy flag per application and the environment (= branch).
+  #    A Domain/** change fans out to ALL four applications.
   # -------------------------------------------------------------------------
   detect-changes:
     name: Detect changes & target
@@ -93,6 +86,8 @@ jobs:
     outputs:
       web: ${{ steps.decide.outputs.web }}
       api: ${{ steps.decide.outputs.api }}
+      sso: ${{ steps.decide.outputs.sso }}
+      svc: ${{ steps.decide.outputs.svc }}
       environment: ${{ steps.decide.outputs.environment }}
     steps:
       - name: Checkout source
@@ -101,13 +96,12 @@ jobs:
           fetch-depth: 0   # full history so we can diff against the parent commit
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
 
-      - name: Decide projects & environment
+      - name: Decide applications & environment
         id: decide
         shell: bash
         run: |
           set -euo pipefail
-          web=false
-          api=false
+          web=false; api=false; sso=false; svc=false
 
           # Branch that triggered CI (auto) or that dispatch was run from (manual).
           BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
@@ -116,39 +110,47 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             # Manual run: operator deploys exactly ONE application.
             case "${{ github.event.inputs.application }}" in
-              web) web=true ;;
-              api) api=true ;;
+              dashboard-web)   web=true ;;
+              mjh-api)         api=true ;;
+              dashboard-sso)   sso=true ;;
+              windows-service) svc=true ;;
             esac
           else
             # Auto run: diff the pushed commit against its first parent.
             HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
             BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo '')"
             if [ -z "$BASE_SHA" ]; then
-              web=true; api=true          # no parent (first commit) -> deploy all
+              web=true; api=true; sso=true; svc=true   # first commit -> deploy all
             else
               CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
               echo "Changed files:"; echo "$CHANGED"
 
-              # Shared Domain project -> redeploy BOTH apps.
               domain=false
-              echo "$CHANGED" | grep -q '^Domain/'  && domain=true || true
-              echo "$CHANGED" | grep -q '^mvc web/' && web=true    || true
-              echo "$CHANGED" | grep -q '^web api/' && api=true    || true
-              if [ "$domain" = "true" ]; then web=true; api=true; fi
+              echo "$CHANGED" | grep -q '^Domain/'         && domain=true || true
+              echo "$CHANGED" | grep -q '^mvc web/'        && web=true    || true
+              echo "$CHANGED" | grep -q '^web api/'        && api=true    || true
+              echo "$CHANGED" | grep -q '^SSO/'            && sso=true    || true
+              echo "$CHANGED" | grep -q '^WindowsService/' && svc=true    || true
+
+              # Shared Domain project -> redeploy ALL four applications.
+              if [ "$domain" = "true" ]; then web=true; api=true; sso=true; svc=true; fi
             fi
           fi
 
-          echo "web=$web"                 >> "$GITHUB_OUTPUT"
-          echo "api=$api"                 >> "$GITHUB_OUTPUT"
-          echo "environment=$BRANCH"      >> "$GITHUB_OUTPUT"
-          echo "::notice::branch=$BRANCH  deploy-web=$web  deploy-api=$api"
+          {
+            echo "web=$web"
+            echo "api=$api"
+            echo "sso=$sso"
+            echo "svc=$svc"
+            echo "environment=$BRANCH"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::branch=$BRANCH web=$web api=$api sso=$sso svc=$svc"
 
-  # -------------------------------------------------------------------------
-  # 1a. PUBLISH WEB — build & package the Web app. Runs only if Web changed.
-  #     Starts the Web lane, independent of the API lane.
-  # -------------------------------------------------------------------------
+  # =========================================================================
+  # PUBLISH LANES — build & package each changed application independently.
+  # =========================================================================
   publish-web:
-    name: Publish Web
+    name: Publish Dashboard Web
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.web == 'true'
@@ -157,31 +159,21 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
-
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-
-      - name: Publish MVC app
-        run: >-
-          dotnet publish "$MVC_PROJECT"
-          --configuration $DOTNET_CONFIGURATION
-          --output ./publish/mvc
-
-      - name: Upload MVC artifact
+      - name: Publish Dashboard Web
+        run: dotnet publish "$WEB_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/web
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.MVC_ARTIFACT }}
-          path: ./publish/mvc
+          name: ${{ env.WEB_ARTIFACT }}
+          path: ./publish/web
           retention-days: 7
 
-  # -------------------------------------------------------------------------
-  # 1b. PUBLISH API — build & package the API. Runs only if the API changed.
-  #     Starts the API lane, independent of the Web lane.
-  # -------------------------------------------------------------------------
   publish-api:
-    name: Publish API
+    name: Publish MJH API
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.api == 'true'
@@ -190,109 +182,126 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
-
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
-
-      - name: Publish Web API
-        run: >-
-          dotnet publish "$API_PROJECT"
-          --configuration $DOTNET_CONFIGURATION
-          --output ./publish/api
-
-      - name: Upload API artifact
+      - name: Publish MJH API
+        run: dotnet publish "$API_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/api
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.API_ARTIFACT }}
           path: ./publish/api
           retention-days: 7
 
-  # -------------------------------------------------------------------------
-  # 2a. DEPLOY WEB — self-hosted Windows runner. Uses the app-specific
-  #     environment `web-<branch>` (e.g. web-dev), which holds the Web deploy
-  #     path variable AND its own Required reviewers — so Web is approved
-  #     SEPARATELY from the API. Only runs if Web changed.
-  # -------------------------------------------------------------------------
+  publish-sso:
+    name: Publish Dashboard SSO
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.sso == 'true'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Publish Dashboard SSO
+        run: dotnet publish "$SSO_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/sso
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SSO_ARTIFACT }}
+          path: ./publish/sso
+          retention-days: 7
+
+  publish-svc:
+    name: Publish Windows Service
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.svc == 'true'
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Publish Windows Service
+        run: dotnet publish "$SVC_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/svc
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SVC_ARTIFACT }}
+          path: ./publish/svc
+          retention-days: 7
+
+  # =========================================================================
+  # DEPLOY LANES — self-hosted Windows runner. Each app uses its own
+  # environment (app-branch), so it is approved and configured separately.
+  # =========================================================================
   deploy-web:
-    name: Deploy Web (${{ needs.detect-changes.outputs.environment }})
+    name: Deploy Dashboard Web (${{ needs.detect-changes.outputs.environment }})
     needs: [detect-changes, publish-web]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.web == 'true'
     environment: web-${{ needs.detect-changes.outputs.environment }}
     steps:
-      - name: Download MVC artifact
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: ${{ env.MVC_ARTIFACT }}
-          path: .\publish\mvc
-
-      # Execution-policy override so the runner can't block the temp script.
-      - name: Deploy MVC
+          name: ${{ env.WEB_ARTIFACT }}
+          path: .\publish\web
+      - name: Deploy Dashboard Web
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ vars.MVC_DEPLOY_PATH }}
+          DEST:            ${{ vars.WEB_DEPLOY_PATH }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.WEB_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
           EXCLUDE_DIRS:    ${{ vars.WEB_EXCLUDE_DIRS  || 'uploads' }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "MVC_DEPLOY_PATH variable is not set for this environment." }
-          $source = (Resolve-Path ".\publish\mvc").Path
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "WEB_DEPLOY_PATH variable is not set for this environment." }
+          $source = (Resolve-Path ".\publish\web").Path
           $dest   = $env:DEST
-
-          # If the target is a remote UNC share and credentials are provided,
-          # authenticate to it first (local D:\ paths skip this).
           $mappedRoot = $null
           if ($dest -like '\\*' -and $env:DEPLOY_USER) {
-            $parts = $dest.TrimStart('\').Split('\')
-            $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
             net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
           }
           try {
             New-Item -ItemType Directory -Force -Path $dest | Out-Null
-
-            # Preserve server-managed files/folders: /XF and /XD exclude them
-            # from BOTH the copy and the /MIR purge, so existing copies survive.
-            # Entries may be separated by new lines, commas, or semicolons.
             $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
             $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
-
             $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
             if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
             if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
-
             robocopy $source $dest @roboArgs
             if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
-            Write-Host "Deployed Web to $dest (preserved: $env:EXCLUDE_FILES $env:EXCLUDE_DIRS)"
+            Write-Host "Deployed Dashboard Web to $dest"
           }
-          finally {
-            if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null }
-          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
           exit 0
 
-  # -------------------------------------------------------------------------
-  # 2b. DEPLOY API — self-hosted Windows runner. Uses the app-specific
-  #     environment `api-<branch>` (e.g. api-dev), with its own API deploy
-  #     path variable AND its own Required reviewers — approved SEPARATELY
-  #     from the Web app. Only runs if the API changed.
-  # -------------------------------------------------------------------------
   deploy-api:
-    name: Deploy API (${{ needs.detect-changes.outputs.environment }})
+    name: Deploy MJH API (${{ needs.detect-changes.outputs.environment }})
     needs: [detect-changes, publish-api]
     runs-on: [self-hosted, windows]
     if: needs.detect-changes.outputs.api == 'true'
     environment: api-${{ needs.detect-changes.outputs.environment }}
     steps:
-      - name: Download API artifact
+      - name: Download artifact
         uses: actions/download-artifact@v4
         with:
           name: ${{ env.API_ARTIFACT }}
           path: .\publish\api
-
-      - name: Deploy API
+      - name: Deploy MJH API
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
           DEST:            ${{ vars.API_DEPLOY_PATH }}
@@ -305,31 +314,129 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "API_DEPLOY_PATH variable is not set for this environment." }
           $source = (Resolve-Path ".\publish\api").Path
           $dest   = $env:DEST
-
           $mappedRoot = $null
           if ($dest -like '\\*' -and $env:DEPLOY_USER) {
-            $parts = $dest.TrimStart('\').Split('\')
-            $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+            robocopy $source $dest @roboArgs
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+            Write-Host "Deployed MJH API to $dest"
+          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
+          exit 0
+
+  deploy-sso:
+    name: Deploy Dashboard SSO (${{ needs.detect-changes.outputs.environment }})
+    needs: [detect-changes, publish-sso]
+    runs-on: [self-hosted, windows]
+    if: needs.detect-changes.outputs.sso == 'true'
+    environment: sso-${{ needs.detect-changes.outputs.environment }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SSO_ARTIFACT }}
+          path: .\publish\sso
+      - name: Deploy Dashboard SSO
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ vars.SSO_DEPLOY_PATH }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.SSO_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.SSO_EXCLUDE_DIRS  || 'uploads' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "SSO_DEPLOY_PATH variable is not set for this environment." }
+          $source = (Resolve-Path ".\publish\sso").Path
+          $dest   = $env:DEST
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+            robocopy $source $dest @roboArgs
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+            Write-Host "Deployed Dashboard SSO to $dest"
+          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
+          exit 0
+
+  # Windows Service: stop the service before copying (files are locked while
+  # running), then restart it. Set the service name in vars.SVC_SERVICE_NAME.
+  deploy-svc:
+    name: Deploy Windows Service (${{ needs.detect-changes.outputs.environment }})
+    needs: [detect-changes, publish-svc]
+    runs-on: [self-hosted, windows]
+    if: needs.detect-changes.outputs.svc == 'true'
+    environment: svc-${{ needs.detect-changes.outputs.environment }}
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SVC_ARTIFACT }}
+          path: .\publish\svc
+      - name: Deploy Windows Service
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ vars.SVC_DEPLOY_PATH }}
+          SERVICE_NAME:    ${{ vars.SVC_SERVICE_NAME }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.SVC_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.SVC_EXCLUDE_DIRS  || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "SVC_DEPLOY_PATH variable is not set for this environment." }
+          $source = (Resolve-Path ".\publish\svc").Path
+          $dest   = $env:DEST
+          $svcName = $env:SERVICE_NAME
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
             net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
           }
           try {
             New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
-            # Preserve server-managed files/folders: /XF and /XD exclude them
-            # from BOTH the copy and the /MIR purge, so existing copies survive.
-            # Entries may be separated by new lines, commas, or semicolons.
+            # Stop the service so its binaries can be replaced.
+            $svcObj = $null
+            if ($svcName) { $svcObj = Get-Service -Name $svcName -ErrorAction SilentlyContinue }
+            if ($svcObj -and $svcObj.Status -ne 'Stopped') {
+              Write-Host "Stopping service $svcName ..."
+              Stop-Service -Name $svcName -Force
+              (Get-Service -Name $svcName).WaitForStatus('Stopped', '00:01:00')
+            }
+
             $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
             $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
-
             $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
             if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
             if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
-
             robocopy $source $dest @roboArgs
             if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
-            Write-Host "Deployed API to $dest (preserved: $env:EXCLUDE_FILES $env:EXCLUDE_DIRS)"
+
+            # Restart the service if we stopped it (or it exists).
+            if ($svcObj) {
+              Write-Host "Starting service $svcName ..."
+              Start-Service -Name $svcName
+            }
+            Write-Host "Deployed Windows Service to $dest"
           }
-          finally {
-            if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null }
-          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
           exit 0
