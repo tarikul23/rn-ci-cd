@@ -1,4 +1,4 @@
-name: Provision Deploy Environments
+name: Deploy Environments
 
 # ---------------------------------------------------------------------------
 # One-time (manually triggered) provisioning of the per-app, per-branch
