@@ -249,7 +249,7 @@ jobs:
   # environment (app-branch), so it is approved and configured separately.
   # =========================================================================
   deploy-web:
-    name: Deploy Dashboard Web (${{ github.event.workflow_run.head_branch || github.ref_name }})
+    name: Deploy Web (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-web]
     runs-on: [self-hosted, windows]
     environment: web-${{ needs.detect-changes.outputs.environment }}
@@ -292,7 +292,7 @@ jobs:
           exit 0
 
   deploy-api:
-    name: Deploy MJH API (${{ github.event.workflow_run.head_branch || github.ref_name }})
+    name: Deploy API (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-api]
     runs-on: [self-hosted, windows]
     environment: api-${{ needs.detect-changes.outputs.environment }}
@@ -335,7 +335,7 @@ jobs:
           exit 0
 
   deploy-sso:
-    name: Deploy Dashboard SSO (${{ github.event.workflow_run.head_branch || github.ref_name }})
+    name: Deploy SSO (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-sso]
     runs-on: [self-hosted, windows]
     environment: sso-${{ needs.detect-changes.outputs.environment }}
@@ -380,7 +380,7 @@ jobs:
   # Windows Service: stop the service before copying (files are locked while
   # running), then restart it. Set the service name in vars.SVC_SERVICE_NAME.
   deploy-svc:
-    name: Deploy Windows Service (${{ github.event.workflow_run.head_branch || github.ref_name }})
+    name: Deploy SVC (${{ github.event.workflow_run.head_branch || github.ref_name }})
     needs: [detect-changes, publish-svc]
     runs-on: [self-hosted, windows]
     environment: svc-${{ needs.detect-changes.outputs.environment }}
