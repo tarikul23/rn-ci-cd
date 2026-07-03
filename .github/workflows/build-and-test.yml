@@ -16,8 +16,13 @@ run-name: >-
 on:
   push:
     branches: [dev, staging, hotfix]
+    # Don't build when a commit changes ONLY workflow files (nothing to compile).
+    paths-ignore:
+      - '.github/workflows/**'
   pull_request:
     branches: [dev, staging, hotfix]
+    paths-ignore:
+      - '.github/workflows/**'
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
