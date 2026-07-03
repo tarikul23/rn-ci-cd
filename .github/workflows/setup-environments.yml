@@ -2,14 +2,16 @@ name: Provision Deploy Environments
 
 # ---------------------------------------------------------------------------
 # One-time (manually triggered) provisioning of the per-app, per-branch
-# GitHub Environments used by deploy-applications.yml:
+# GitHub Environments used by deploy-applications.yml (4 apps x 3 branches):
 #
-#   web-dev  api-dev  web-staging  api-staging  web-hotfix  api-hotfix
+#   web-dev  api-dev  sso-dev  svc-dev
+#   web-staging  api-staging  sso-staging  svc-staging
+#   web-hotfix   api-hotfix   sso-hotfix   svc-hotfix
 #
 # For each it sets:
-#   - the deploy-path VARIABLE (MVC_DEPLOY_PATH for web-*, API_DEPLOY_PATH for api-*)
+#   - the deploy-path VARIABLE (WEB_/API_/SSO_/SVC_DEPLOY_PATH)
 #   - the credential SECRETS  (DEPLOY_USER / DEPLOY_PASSWORD) if provided
-#   - (optionally) Required reviewers, so Web and API are approved separately
+#   - (optionally) Required reviewers, so every app is approved separately
 #
 # WHY A PAT: managing variables/secrets/environments needs admin rights that
 # the built-in GITHUB_TOKEN does not have. Store a PAT as GH_ADMIN_TOKEN.
@@ -46,12 +48,18 @@ jobs:
       # Edit the paths to match your servers. '|' is the delimiter so Windows
       # drive-letter colons in the paths are preserved.
       ENV_CONFIG: |
-        web-dev|MVC_DEPLOY_PATH|D:\DevOps\dev\web
+        web-dev|WEB_DEPLOY_PATH|D:\DevOps\dev\web
         api-dev|API_DEPLOY_PATH|D:\DevOps\dev\api
-        web-staging|MVC_DEPLOY_PATH|D:\DevOps\staging\web
+        sso-dev|SSO_DEPLOY_PATH|D:\DevOps\dev\sso
+        svc-dev|SVC_DEPLOY_PATH|D:\DevOps\dev\svc
+        web-staging|WEB_DEPLOY_PATH|D:\DevOps\staging\web
         api-staging|API_DEPLOY_PATH|D:\DevOps\staging\api
-        web-hotfix|MVC_DEPLOY_PATH|D:\DevOps\hotfix\web
+        sso-staging|SSO_DEPLOY_PATH|D:\DevOps\staging\sso
+        svc-staging|SVC_DEPLOY_PATH|D:\DevOps\staging\svc
+        web-hotfix|WEB_DEPLOY_PATH|D:\DevOps\hotfix\web
         api-hotfix|API_DEPLOY_PATH|D:\DevOps\hotfix\api
+        sso-hotfix|SSO_DEPLOY_PATH|D:\DevOps\hotfix\sso
+        svc-hotfix|SVC_DEPLOY_PATH|D:\DevOps\hotfix\svc
       DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
       DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
       REVIEWERS: ${{ vars.REVIEWERS }}
