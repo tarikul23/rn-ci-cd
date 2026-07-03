@@ -83,7 +83,9 @@ jobs:
   #    A Domain/** change fans out to ALL four applications.
   # -------------------------------------------------------------------------
   detect-changes:
-    name: Detect changes & target
+    # This job always runs, so its name reliably shows the branch — even when
+    # every deploy lane is skipped or a publish is rejected.
+    name: Detect changes & target (${{ github.event.workflow_run.head_branch || github.ref_name }})
     runs-on: ubuntu-latest
     if: >-
       github.event_name == 'workflow_dispatch' ||
@@ -280,10 +282,13 @@ jobs:
   # from repository secrets.
   # =========================================================================
   deploy-web:
-    name: Deploy Web (${{ needs.detect-changes.outputs.environment }})
+    name: Deploy Web
     needs: [detect-changes, publish-web]
     runs-on: [self-hosted, windows]
     steps:
+      - name: Target
+        shell: powershell
+        run: Write-Host "Deploying Dashboard Web on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-web.outputs.deploy_path }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -322,10 +327,13 @@ jobs:
           exit 0
 
   deploy-api:
-    name: Deploy API (${{ needs.detect-changes.outputs.environment }})
+    name: Deploy API
     needs: [detect-changes, publish-api]
     runs-on: [self-hosted, windows]
     steps:
+      - name: Target
+        shell: powershell
+        run: Write-Host "Deploying MJH API on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-api.outputs.deploy_path }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -364,10 +372,13 @@ jobs:
           exit 0
 
   deploy-sso:
-    name: Deploy SSO (${{ needs.detect-changes.outputs.environment }})
+    name: Deploy SSO
     needs: [detect-changes, publish-sso]
     runs-on: [self-hosted, windows]
     steps:
+      - name: Target
+        shell: powershell
+        run: Write-Host "Deploying Dashboard SSO on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-sso.outputs.deploy_path }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -408,10 +419,13 @@ jobs:
   # Windows Service: stop the service before copying (files are locked while
   # running), then restart it. Set the service name in vars.SVC_SERVICE_NAME.
   deploy-svc:
-    name: Deploy SVC (${{ needs.detect-changes.outputs.environment }})
+    name: Deploy SVC
     needs: [detect-changes, publish-svc]
     runs-on: [self-hosted, windows]
     steps:
+      - name: Target
+        shell: powershell
+        run: Write-Host "Deploying Windows Service '${{ needs.publish-svc.outputs.service_name }}' on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-svc.outputs.deploy_path }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -466,24 +480,3 @@ jobs:
           }
           finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
           exit 0
-
-  # =========================================================================
-  # REJECTION / FAILURE HANDLER — runs only if an approval was rejected or a
-  # publish job failed. GitHub has no dedicated "reject" event, so this reacts
-  # to the failed publish job (a rejected review surfaces as a failure).
-  # Skipped lanes (unchanged apps) do NOT trigger this.
-  # =========================================================================
-  on-rejected:
-    name: On rejection / failure
-    # Include detect-changes so we can read the branch it already resolved —
-    # github.event.workflow_run.head_branch is not reliably available here.
-    needs: [detect-changes, publish-web, publish-api, publish-sso, publish-svc]
-    if: failure()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report rejected / failed deployment
-        env:
-          BRANCH: ${{ needs.detect-changes.outputs.environment }}
-        run: |
-          echo "::warning title=Deployment not completed::A deployment on '$BRANCH' was rejected by a reviewer or a build failed. Nothing was deployed for the affected application(s)."
-          echo "Publish results — web:${{ needs.publish-web.result }} api:${{ needs.publish-api.result }} sso:${{ needs.publish-sso.result }} svc:${{ needs.publish-svc.result }}"
