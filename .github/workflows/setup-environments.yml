@@ -1,0 +1,121 @@
+name: Provision Deploy Environments
+
+# ---------------------------------------------------------------------------
+# One-time (manually triggered) provisioning of the per-app, per-branch
+# GitHub Environments used by deploy-applications.yml (4 apps x 3 branches):
+#
+#   web-dev  api-dev  sso-dev  svc-dev
+#   web-staging  api-staging  sso-staging  svc-staging
+#   web-hotfix   api-hotfix   sso-hotfix   svc-hotfix
+#
+# For each it sets:
+#   - the deploy-path VARIABLE (WEB_/API_/SSO_/SVC_DEPLOY_PATH)
+#   - the credential SECRETS  (DEPLOY_USER / DEPLOY_PASSWORD) if provided
+#   - (optionally) Required reviewers, so every app is approved separately
+#
+# WHY A PAT: managing variables/secrets/environments needs admin rights that
+# the built-in GITHUB_TOKEN does not have. Store a PAT as GH_ADMIN_TOKEN.
+#
+# PREREQUISITES (repo-level — Settings → Secrets and variables → Actions):
+#   Secret  GH_ADMIN_TOKEN   PAT with 'repo' + admin (classic), OR fine-grained
+#                            with Administration + Secrets + Environments +
+#                            Variables = read/write.
+#   Secret  DEPLOY_USER      (optional) username for remote UNC shares.
+#   Secret  DEPLOY_PASSWORD  (optional) password for the above.
+#   Var     REVIEWERS        (optional) comma-separated GitHub usernames to set
+#                            as Required reviewers when 'set_reviewers' is true.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      set_reviewers:
+        description: 'Also set Required reviewers from the REVIEWERS variable?'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  provision:
+    name: Provision environments & config
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      REPO: ${{ github.repository }}
+      # One entry per line:  <environment>|<variableName>|<deployPath>
+      # Edit the paths to match your servers. '|' is the delimiter so Windows
+      # drive-letter colons in the paths are preserved.
+      ENV_CONFIG: |
+        web-dev|WEB_DEPLOY_PATH|D:\DevOps\dev\web
+        api-dev|API_DEPLOY_PATH|D:\DevOps\dev\api
+        sso-dev|SSO_DEPLOY_PATH|D:\DevOps\dev\sso
+        svc-dev|SVC_DEPLOY_PATH|D:\DevOps\dev\svc
+        web-staging|WEB_DEPLOY_PATH|D:\DevOps\staging\web
+        api-staging|API_DEPLOY_PATH|D:\DevOps\staging\api
+        sso-staging|SSO_DEPLOY_PATH|D:\DevOps\staging\sso
+        svc-staging|SVC_DEPLOY_PATH|D:\DevOps\staging\svc
+        web-hotfix|WEB_DEPLOY_PATH|D:\DevOps\hotfix\web
+        api-hotfix|API_DEPLOY_PATH|D:\DevOps\hotfix\api
+        sso-hotfix|SSO_DEPLOY_PATH|D:\DevOps\hotfix\sso
+        svc-hotfix|SVC_DEPLOY_PATH|D:\DevOps\hotfix\svc
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+      REVIEWERS: ${{ vars.REVIEWERS }}
+      SET_REVIEWERS: ${{ inputs.set_reviewers }}
+    steps:
+      - name: Verify admin token is present
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Repo secret GH_ADMIN_TOKEN is not set. Create a PAT with admin rights first."
+            exit 1
+          fi
+
+      - name: Provision environments, variables, secrets (and reviewers)
+        run: |
+          set -euo pipefail
+
+          # Optionally resolve reviewer usernames -> user IDs for protection rules.
+          reviewerJson=""
+          if [ "$SET_REVIEWERS" = "true" ] && [ -n "${REVIEWERS// }" ]; then
+            IFS=',' read -ra names <<< "$REVIEWERS"
+            for n in "${names[@]}"; do
+              n="$(echo "$n" | xargs)"; [ -z "$n" ] && continue
+              id="$(gh api "users/$n" --jq '.id')"
+              reviewerJson="${reviewerJson}{\"type\":\"User\",\"id\":$id},"
+            done
+            reviewerJson="${reviewerJson%,}"
+            echo "Reviewers to apply: $REVIEWERS"
+          fi
+
+          while IFS='|' read -r envName varName deployPath; do
+            envName="$(echo "$envName" | xargs)"
+            [ -z "$envName" ] && continue
+            varName="$(echo "$varName" | xargs)"
+            deployPath="$(echo "$deployPath" | sed -e 's/^[[:space:]]*//')"
+            echo "== $envName =="
+
+            # Create/update the environment (idempotent). Include reviewers if set.
+            if [ -n "$reviewerJson" ]; then
+              printf '{"reviewers":[%s]}' "$reviewerJson" \
+                | gh api --method PUT "repos/$REPO/environments/$envName" --input - >/dev/null
+              echo "  environment ready (with reviewers)"
+            else
+              gh api --method PUT "repos/$REPO/environments/$envName" >/dev/null
+              echo "  environment ready"
+            fi
+
+            # Deploy-path VARIABLE (non-sensitive).
+            gh variable set "$varName" --env "$envName" --repo "$REPO" --body "$deployPath"
+            echo "  var $varName = $deployPath"
+
+            # Credential SECRETS (only if provided at repo level).
+            if [ -n "${DEPLOY_USER// }" ]; then
+              gh secret set DEPLOY_USER     --env "$envName" --repo "$REPO" --body "$DEPLOY_USER"
+              gh secret set DEPLOY_PASSWORD --env "$envName" --repo "$REPO" --body "$DEPLOY_PASSWORD"
+              echo "  secrets DEPLOY_USER / DEPLOY_PASSWORD set"
+            fi
+          done <<< "$ENV_CONFIG"
+
+          echo "Done. Verify at: https://github.com/$REPO/settings/environments"
