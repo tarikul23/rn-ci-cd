@@ -1,7 +1,10 @@
 name: Deploy Applications (CD - Manual Approval)
 
-# Run title: "<target branch> / <application> by <actor>".
-run-name: CD → ${{ inputs.target }} / ${{ inputs.application }} by ${{ github.actor }}
+# Run title: "<target branch> — ticked apps — by <actor>".
+run-name: >-
+  CD → ${{ inputs.target }} —
+  ${{ inputs.deploy_web && 'web ' || '' }}${{ inputs.deploy_api && 'api ' || '' }}${{ inputs.deploy_sso && 'sso ' || '' }}${{ inputs.deploy_svc && 'svc ' || '' }}${{ (inputs.deploy_web || inputs.deploy_api || inputs.deploy_sso || inputs.deploy_svc) && '' || 'changed-only' }}
+  — by ${{ github.actor }}
 
 # ---------------------------------------------------------------------------
 # Continuous Deployment WITHOUT GitHub "Deployment protection rules".
@@ -14,7 +17,7 @@ run-name: CD → ${{ inputs.target }} / ${{ inputs.application }} by ${{ github.
 # HOW IT BEHAVES:
 #   CI succeeds  ──►  nothing happens here. Check CI is green, then deploy.
 #
-#   You press "Run workflow" (target branch + application + confirm)
+#   You press "Run workflow" (target branch + app checkboxes + confirm)
 #     └─ detect-changes ─┬─ publish-web ─ deploy-web   (Dashboard Web)
 #                        ├─ publish-api ─ deploy-api   (MJH API)
 #                        ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
@@ -59,18 +62,28 @@ on:
         default: 'dev'
         type: choice
         options: [dev, staging, hotfix]
-      application:
-        description: 'Application(s) to deploy'
-        required: true
-        default: 'changed-only'
-        type: choice
-        options:
-          - changed-only        # diff the branch head against its parent
-          - all                 # all four applications
-          - dashboard-web
-          - mjh-api
-          - dashboard-sso
-          - windows-service
+      # Tick any combination. Leave ALL FOUR unticked to fall back to
+      # "changed-only": deploy whatever the branch head's commit touched.
+      deploy_web:
+        description: 'Dashboard Web   (mvc web/)'
+        required: false
+        default: false
+        type: boolean
+      deploy_api:
+        description: 'MJH API   (web api/)'
+        required: false
+        default: false
+        type: boolean
+      deploy_sso:
+        description: 'Dashboard SSO   (SSO/)'
+        required: false
+        default: false
+        type: boolean
+      deploy_svc:
+        description: 'Windows Service   (WindowsService/)'
+        required: false
+        default: false
+        type: boolean
       confirm:
         description: 'Type the target branch name again to confirm'
         required: true
@@ -167,45 +180,50 @@ jobs:
         shell: bash
         env:
           BRANCH: ${{ inputs.target }}
-          SELECTION: ${{ inputs.application }}
           REASON: ${{ inputs.reason }}
+          # Checkboxes arrive as the strings "true" / "false".
+          WEB_IN: ${{ inputs.deploy_web }}
+          API_IN: ${{ inputs.deploy_api }}
+          SSO_IN: ${{ inputs.deploy_sso }}
+          SVC_IN: ${{ inputs.deploy_svc }}
         run: |
           set -euo pipefail
           web=false; api=false; sso=false; svc=false
           SHA="$(git rev-parse HEAD)"
-          echo "Target: $BRANCH @ $SHA (selection: $SELECTION)"
 
           case "$BRANCH" in
             dev|staging|hotfix) ;;
             *) echo "::error::'$BRANCH' is not deployable. Use dev, staging or hotfix."; exit 1 ;;
           esac
 
-          case "$SELECTION" in
-            dashboard-web)   web=true ;;
-            mjh-api)         api=true ;;
-            dashboard-sso)   sso=true ;;
-            windows-service) svc=true ;;
-            all)             web=true; api=true; sso=true; svc=true ;;
-            changed-only)
-              # First-parent diff: what did this commit actually touch?
-              BASE_SHA="$(git rev-parse 'HEAD^' 2>/dev/null || echo '')"
-              if [ -z "$BASE_SHA" ]; then
-                web=true; api=true; sso=true; svc=true   # first commit -> deploy all
-              else
-                CHANGED="$(git diff --name-only "$BASE_SHA" HEAD)"
-                echo "Changed files:"; echo "$CHANGED"
-                domain=false
-                echo "$CHANGED" | grep -q '^Domain/'         && domain=true || true
-                echo "$CHANGED" | grep -q '^mvc web/'        && web=true    || true
-                echo "$CHANGED" | grep -q '^web api/'        && api=true    || true
-                echo "$CHANGED" | grep -q '^SSO/'            && sso=true    || true
-                echo "$CHANGED" | grep -q '^WindowsService/' && svc=true    || true
-                # Shared Domain project -> redeploy ALL four applications.
-                if [ "$domain" = "true" ]; then web=true; api=true; sso=true; svc=true; fi
-              fi
-              ;;
-            *) echo "::error::Unknown application '$SELECTION'."; exit 1 ;;
-          esac
+          # Ticked boxes win outright — no diffing, deploy exactly what was asked.
+          [ "$WEB_IN" = "true" ] && web=true || true
+          [ "$API_IN" = "true" ] && api=true || true
+          [ "$SSO_IN" = "true" ] && sso=true || true
+          [ "$SVC_IN" = "true" ] && svc=true || true
+
+          if [ "$web$api$sso$svc" = "falsefalsefalsefalse" ]; then
+            # Nothing ticked -> fall back to what the head commit touched.
+            SELECTION="changed-only (nothing ticked)"
+            BASE_SHA="$(git rev-parse 'HEAD^' 2>/dev/null || echo '')"
+            if [ -z "$BASE_SHA" ]; then
+              web=true; api=true; sso=true; svc=true   # first commit -> deploy all
+            else
+              CHANGED="$(git diff --name-only "$BASE_SHA" HEAD)"
+              echo "Changed files:"; echo "$CHANGED"
+              domain=false
+              echo "$CHANGED" | grep -q '^Domain/'         && domain=true || true
+              echo "$CHANGED" | grep -q '^mvc web/'        && web=true    || true
+              echo "$CHANGED" | grep -q '^web api/'        && api=true    || true
+              echo "$CHANGED" | grep -q '^SSO/'            && sso=true    || true
+              echo "$CHANGED" | grep -q '^WindowsService/' && svc=true    || true
+              # Shared Domain project -> redeploy ALL four applications.
+              if [ "$domain" = "true" ]; then web=true; api=true; sso=true; svc=true; fi
+            fi
+          else
+            SELECTION="explicitly ticked"
+          fi
+          echo "Target: $BRANCH @ $SHA (selection: $SELECTION)"
 
           any=true
           [ "$web$api$sso$svc" = "falsefalsefalsefalse" ] && any=false || true
@@ -236,7 +254,7 @@ jobs:
               echo "## Nothing to deploy"
               echo
               echo "Commit \`${SHA:0:8}\` on \`$BRANCH\` touched no deployable application."
-              echo "Re-run and pick a specific application instead of \`changed-only\` if you meant to force one out."
+              echo "Tick the application you want on the Run workflow form to force one out regardless of the diff."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::error::Nothing to deploy — the last commit on $BRANCH touched no application."
             exit 1
