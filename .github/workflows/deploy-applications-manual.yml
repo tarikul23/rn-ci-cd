@@ -1,0 +1,648 @@
+name: Deploy Applications (CD - Manual)
+
+# Manual run: "<branch> / <application> by <actor>". Automatic (post-CI) run:
+# just reports what changed and waits for a human to start the deploy.
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('CD manual → {0} / {1} by {2}', github.ref_name, inputs.application, github.actor)
+      || format('CD check → {0}: {1}', github.event.workflow_run.head_branch, github.event.workflow_run.display_title) }}
+
+# ---------------------------------------------------------------------------
+# Continuous Deployment WITHOUT GitHub "Deployment protection rules".
+#
+# WHY: Required reviewers / wait timers are an Environments *protection rule*,
+# which is unavailable on private repos on the Free plan (and to non-admins).
+# This workflow keeps the "nothing ships until a human says so" property using
+# only features available on every plan:
+#
+#   1. NOTHING deploys automatically. A successful CI run only *reports* which
+#      applications changed (job `report`) and links to the deploy button.
+#   2. Deploying requires a deliberate `workflow_dispatch` — the manual run IS
+#      the approval, and GitHub records who pressed it in the run metadata.
+#   3. The `gate` job hardens that press:
+#        - the operator must type the branch name into `confirm`
+#        - the operator must be listed in the repo variable CD_APPROVERS
+#        - the branch must be dev / staging / hotfix
+#
+# Environments are still used (web-dev, api-staging, ...) but ONLY as the
+# holder of the deploy-path variables — no protection rule required.
+#
+# Flow:
+#   CI success ──► report (summary only, no deploy)
+#
+#   human presses "Run workflow"
+#        └─ gate ─┬─ publish-web ─ deploy-web   (Dashboard Web)
+#                 ├─ publish-api ─ deploy-api   (MJH API)
+#                 ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
+#                 └─ publish-svc ─ deploy-svc   (Windows Service)
+#
+# SETUP: add a repository VARIABLE (Settings -> Secrets and variables ->
+# Actions -> Variables):
+#   CD_APPROVERS = comma-separated GitHub logins allowed to deploy
+#                  e.g. "tarikul23,team-lead-login"
+# If it is left empty the gate only warns, so the workflow still runs on day 1.
+#
+# HONEST LIMIT: this is an in-workflow gate, so anyone with write access could
+# edit this file to bypass it. Protect dev/staging/hotfix with a branch ruleset
+# that requires PR review for `.github/**` to close that hole.
+# ---------------------------------------------------------------------------
+
+on:
+  # Post-CI: report only. Never deploys.
+  # NOTE: must match the CI workflow's `name:` exactly.
+  workflow_run:
+    workflows: ["Build & Test (CI)"]
+    types: [completed]
+    branches: [dev, staging, hotfix]
+
+  # The approval. Run this from the branch you want to deploy.
+  workflow_dispatch:
+    inputs:
+      application:
+        description: 'Application(s) to deploy'
+        required: true
+        default: 'changed-only'
+        type: choice
+        options:
+          - changed-only        # diff the branch head against its parent
+          - all                 # all four applications
+          - dashboard-web
+          - mjh-api
+          - dashboard-sso
+          - windows-service
+      confirm:
+        description: 'Type the branch name to confirm (dev / staging / hotfix)'
+        required: true
+        type: string
+      reason:
+        description: 'Why are you deploying? (shown in the run summary)'
+        required: false
+        default: 'manual deployment'
+        type: string
+
+concurrency:
+  # One in-flight deploy per branch; never interrupt an active deploy.
+  group: cd-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # Multiple SDKs: Web + API target net10.0; SSO + WindowsService target net8.0.
+  DOTNET_VERSION: |
+    8.0.x
+    10.0.x
+  DOTNET_CONFIGURATION: 'Release'
+  # Project files (source of each application).
+  WEB_PROJECT: 'mvc web/DevOps.csproj'
+  API_PROJECT: 'web api/web api.csproj'
+  SSO_PROJECT: 'SSO/SSO.csproj'
+  SVC_PROJECT: 'WindowsService/WindowsService.csproj'
+  # Build artifact names (one per application).
+  WEB_ARTIFACT: 'dashboard-web'
+  API_ARTIFACT: 'mjh-api'
+  SSO_ARTIFACT: 'dashboard-sso'
+  SVC_ARTIFACT: 'windows-service'
+  DOTNET_CLI_TELEMETRY_OPTOUT: 'true'
+  DOTNET_NOLOGO: 'true'
+
+jobs:
+  # =========================================================================
+  # A. POST-CI REPORT — runs after a green CI build. Deploys NOTHING; it only
+  #    tells you which applications are pending and how to release them.
+  # =========================================================================
+  report:
+    name: Pending deployment report (${{ github.event.workflow_run.head_branch }})
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history so we can diff against the parent commit
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Summarise what is waiting to be deployed
+        shell: bash
+        env:
+          BRANCH:   ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          TITLE:    ${{ github.event.workflow_run.display_title }}
+          RUN_URL:  ${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy-applications-manual.yml
+        run: |
+          set -euo pipefail
+          BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo '')"
+          apps=""
+          if [ -z "$BASE_SHA" ]; then
+            apps="dashboard-web mjh-api dashboard-sso windows-service (first commit)"
+          else
+            CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+            echo "Changed files:"; echo "$CHANGED"
+            domain=false
+            echo "$CHANGED" | grep -q '^Domain/'         && domain=true                  || true
+            echo "$CHANGED" | grep -q '^mvc web/'        && apps="$apps dashboard-web"   || true
+            echo "$CHANGED" | grep -q '^web api/'        && apps="$apps mjh-api"         || true
+            echo "$CHANGED" | grep -q '^SSO/'            && apps="$apps dashboard-sso"   || true
+            echo "$CHANGED" | grep -q '^WindowsService/' && apps="$apps windows-service" || true
+            # Shared Domain project -> all four applications are pending.
+            if [ "$domain" = "true" ]; then
+              apps="dashboard-web mjh-api dashboard-sso windows-service (Domain changed)"
+            fi
+          fi
+          apps="$(echo "$apps" | sed 's/^ *//')"
+          [ -n "$apps" ] || apps="(nothing deployable changed)"
+
+          {
+            echo "## Awaiting manual approval"
+            echo
+            echo "CI passed on **$BRANCH** — nothing has been deployed."
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Branch | $BRANCH |"
+            echo "| Commit | ${HEAD_SHA:0:8} — $TITLE |"
+            echo "| Pending applications | $apps |"
+            echo
+            echo "### To deploy"
+            echo "1. Open [Deploy Applications (CD - Manual)]($RUN_URL)"
+            echo "2. **Run workflow** -> branch $BRANCH"
+            echo "3. Pick the application, type $BRANCH in *confirm*, press **Run workflow**"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::notice::CI green on $BRANCH. Pending: $apps. Deployment is manual."
+
+  # =========================================================================
+  # B. GATE — this job IS the approval. Only reached via workflow_dispatch.
+  # =========================================================================
+  gate:
+    name: Approval gate (${{ github.ref_name }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.decide.outputs.web }}
+      api: ${{ steps.decide.outputs.api }}
+      sso: ${{ steps.decide.outputs.sso }}
+      svc: ${{ steps.decide.outputs.svc }}
+      environment: ${{ steps.decide.outputs.environment }}
+    steps:
+      # -- 1. the branch must be a deployable one -----------------------------
+      - name: Validate branch
+        shell: bash
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          case "$BRANCH" in
+            dev|staging|hotfix) echo "Target branch: $BRANCH" ;;
+            *) echo "::error::'$BRANCH' is not deployable. Run this from dev, staging or hotfix."; exit 1 ;;
+          esac
+
+      # -- 2. the operator must retype the branch name ------------------------
+      - name: Validate confirmation
+        shell: bash
+        env:
+          BRANCH:  ${{ github.ref_name }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRM" != "$BRANCH" ]; then
+            echo "::error::Confirmation mismatch — you typed '$CONFIRM', expected '$BRANCH'. Nothing was deployed."
+            exit 1
+          fi
+          echo "Confirmation accepted."
+
+      # -- 3. the operator must be an approver --------------------------------
+      #    This replaces "Required reviewers": the allowlist lives in a repo
+      #    variable instead of an environment protection rule.
+      - name: Validate approver
+        shell: bash
+        env:
+          ACTOR:     ${{ github.actor }}
+          APPROVERS: ${{ vars.CD_APPROVERS }}
+        run: |
+          set -euo pipefail
+          if [ -z "${APPROVERS//[[:space:]]/}" ]; then
+            echo "::warning::Repo variable CD_APPROVERS is empty — anyone with write access can deploy. Set it to lock deployments down."
+            exit 0
+          fi
+          if printf '%s' "$APPROVERS" | tr ',;' '\n\n' | tr -d '[:space:]' | grep -Fqix "$ACTOR"; then
+            echo "Approver '$ACTOR' accepted."
+          else
+            echo "::error::'$ACTOR' is not listed in CD_APPROVERS. Ask an approver to run this deployment."
+            exit 1
+          fi
+
+      # -- 4. work out which applications this run covers ---------------------
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref }}
+
+      - name: Decide applications
+        id: decide
+        shell: bash
+        env:
+          BRANCH: ${{ github.ref_name }}
+          APP:    ${{ inputs.application }}
+        run: |
+          set -euo pipefail
+          web=false; api=false; sso=false; svc=false
+
+          case "$APP" in
+            dashboard-web)   web=true ;;
+            mjh-api)         api=true ;;
+            dashboard-sso)   sso=true ;;
+            windows-service) svc=true ;;
+            all)             web=true; api=true; sso=true; svc=true ;;
+            changed-only)
+              # First-parent diff of the branch head, same rule as before:
+              # a Domain/** change fans out to ALL four applications.
+              BASE_SHA="$(git rev-parse 'HEAD^' 2>/dev/null || echo '')"
+              if [ -z "$BASE_SHA" ]; then
+                web=true; api=true; sso=true; svc=true
+              else
+                CHANGED="$(git diff --name-only "$BASE_SHA" HEAD)"
+                echo "Changed files:"; echo "$CHANGED"
+                domain=false
+                echo "$CHANGED" | grep -q '^Domain/'         && domain=true || true
+                echo "$CHANGED" | grep -q '^mvc web/'        && web=true    || true
+                echo "$CHANGED" | grep -q '^web api/'        && api=true    || true
+                echo "$CHANGED" | grep -q '^SSO/'            && sso=true    || true
+                echo "$CHANGED" | grep -q '^WindowsService/' && svc=true    || true
+                if [ "$domain" = "true" ]; then web=true; api=true; sso=true; svc=true; fi
+              fi
+              ;;
+            *) echo "::error::Unknown application '$APP'."; exit 1 ;;
+          esac
+
+          if [ "$web$api$sso$svc" = "falsefalsefalsefalse" ]; then
+            echo "::error::Nothing to deploy — the last commit touched no application. Re-run and pick a specific application instead of 'changed-only'."
+            exit 1
+          fi
+
+          {
+            echo "web=$web"
+            echo "api=$api"
+            echo "sso=$sso"
+            echo "svc=$svc"
+            echo "environment=$BRANCH"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::branch=$BRANCH web=$web api=$api sso=$sso svc=$svc"
+
+      - name: Record the approval
+        shell: bash
+        env:
+          BRANCH: ${{ github.ref_name }}
+          ACTOR:  ${{ github.actor }}
+          REASON: ${{ inputs.reason }}
+          APP:    ${{ inputs.application }}
+          WEB:    ${{ steps.decide.outputs.web }}
+          API:    ${{ steps.decide.outputs.api }}
+          SSO:    ${{ steps.decide.outputs.sso }}
+          SVC:    ${{ steps.decide.outputs.svc }}
+        run: |
+          {
+            echo "## Deployment approved"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Approved by | @$ACTOR |"
+            echo "| Branch | $BRANCH |"
+            echo "| Commit | ${GITHUB_SHA:0:8} |"
+            echo "| Selection | $APP |"
+            echo "| Reason | $REASON |"
+            echo
+            echo "Lanes: web=$WEB api=$API sso=$SSO svc=$SVC"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # =========================================================================
+  # PUBLISH LANES — build & package each selected application independently.
+  # The environment is attached here only to supply the deploy-path variable.
+  # =========================================================================
+  publish-web:
+    name: Publish Dashboard Web
+    needs: gate
+    runs-on: ubuntu-latest
+    if: needs.gate.outputs.web == 'true'
+    environment: web-${{ needs.gate.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
+    steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: echo "deploy_path=${{ vars.WEB_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Publish Dashboard Web
+        run: dotnet publish "$WEB_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/web
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.WEB_ARTIFACT }}
+          path: ./publish/web
+          retention-days: 7
+
+  publish-api:
+    name: Publish MJH API
+    needs: gate
+    runs-on: ubuntu-latest
+    if: needs.gate.outputs.api == 'true'
+    environment: api-${{ needs.gate.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
+    steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: echo "deploy_path=${{ vars.API_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Publish MJH API
+        run: dotnet publish "$API_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/api
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.API_ARTIFACT }}
+          path: ./publish/api
+          retention-days: 7
+
+  publish-sso:
+    name: Publish Dashboard SSO
+    needs: gate
+    runs-on: ubuntu-latest
+    if: needs.gate.outputs.sso == 'true'
+    environment: sso-${{ needs.gate.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
+    steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: echo "deploy_path=${{ vars.SSO_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Publish Dashboard SSO
+        run: dotnet publish "$SSO_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/sso
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SSO_ARTIFACT }}
+          path: ./publish/sso
+          retention-days: 7
+
+  publish-svc:
+    name: Publish Windows Service
+    needs: gate
+    runs-on: ubuntu-latest
+    if: needs.gate.outputs.svc == 'true'
+    environment: svc-${{ needs.gate.outputs.environment }}
+    outputs:
+      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
+      service_name: ${{ steps.cfg.outputs.service_name }}
+    steps:
+      - name: Resolve deploy target
+        id: cfg
+        run: |
+          echo "deploy_path=${{ vars.SVC_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
+          echo "service_name=${{ vars.SVC_SERVICE_NAME }}" >> "$GITHUB_OUTPUT"
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Publish Windows Service
+        run: dotnet publish "$SVC_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/svc
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SVC_ARTIFACT }}
+          path: ./publish/svc
+          retention-days: 7
+
+  # =========================================================================
+  # DEPLOY LANES — self-hosted Windows runner. Approval already happened in the
+  # gate job; the deploy path comes from the publish job's output, credentials
+  # from repository secrets.
+  # =========================================================================
+  deploy-web:
+    name: Deploy Web
+    needs: [gate, publish-web]
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: Target
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        run: Write-Host "Deploying Dashboard Web on branch '${{ needs.gate.outputs.environment }}' to '${{ needs.publish-web.outputs.deploy_path }}'"
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.WEB_ARTIFACT }}
+          path: .\publish\web
+      - name: Deploy Dashboard Web
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ needs.publish-web.outputs.deploy_path }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.WEB_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.WEB_EXCLUDE_DIRS  || 'uploads' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "WEB_DEPLOY_PATH variable is not set for this environment." }
+          $source = (Resolve-Path ".\publish\web").Path
+          $dest   = $env:DEST
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+            robocopy $source $dest @roboArgs
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+            Write-Host "Deployed Dashboard Web to $dest"
+          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
+          exit 0
+
+  deploy-api:
+    name: Deploy API
+    needs: [gate, publish-api]
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: Target
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        run: Write-Host "Deploying MJH API on branch '${{ needs.gate.outputs.environment }}' to '${{ needs.publish-api.outputs.deploy_path }}'"
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.API_ARTIFACT }}
+          path: .\publish\api
+      - name: Deploy MJH API
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ needs.publish-api.outputs.deploy_path }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.API_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.API_EXCLUDE_DIRS  || 'uploads' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "API_DEPLOY_PATH variable is not set for this environment." }
+          $source = (Resolve-Path ".\publish\api").Path
+          $dest   = $env:DEST
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+            robocopy $source $dest @roboArgs
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+            Write-Host "Deployed MJH API to $dest"
+          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
+          exit 0
+
+  deploy-sso:
+    name: Deploy SSO
+    needs: [gate, publish-sso]
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: Target
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        run: Write-Host "Deploying Dashboard SSO on branch '${{ needs.gate.outputs.environment }}' to '${{ needs.publish-sso.outputs.deploy_path }}'"
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SSO_ARTIFACT }}
+          path: .\publish\sso
+      - name: Deploy Dashboard SSO
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ needs.publish-sso.outputs.deploy_path }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.SSO_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.SSO_EXCLUDE_DIRS  || 'uploads' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "SSO_DEPLOY_PATH variable is not set for this environment." }
+          $source = (Resolve-Path ".\publish\sso").Path
+          $dest   = $env:DEST
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+            robocopy $source $dest @roboArgs
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+            Write-Host "Deployed Dashboard SSO to $dest"
+          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
+          exit 0
+
+  # Windows Service: stop the service before copying (files are locked while
+  # running), then restart it. Set the service name in vars.SVC_SERVICE_NAME.
+  deploy-svc:
+    name: Deploy SVC
+    needs: [gate, publish-svc]
+    runs-on: [self-hosted, windows]
+    steps:
+      - name: Target
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        run: Write-Host "Deploying Windows Service '${{ needs.publish-svc.outputs.service_name }}' on branch '${{ needs.gate.outputs.environment }}' to '${{ needs.publish-svc.outputs.deploy_path }}'"
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.SVC_ARTIFACT }}
+          path: .\publish\svc
+      - name: Deploy Windows Service
+        shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
+        env:
+          DEST:            ${{ needs.publish-svc.outputs.deploy_path }}
+          SERVICE_NAME:    ${{ needs.publish-svc.outputs.service_name }}
+          DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          EXCLUDE_FILES:   ${{ vars.SVC_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
+          EXCLUDE_DIRS:    ${{ vars.SVC_EXCLUDE_DIRS  || '' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ([string]::IsNullOrWhiteSpace($env:DEST)) { throw "SVC_DEPLOY_PATH variable is not set for this environment." }
+          $source = (Resolve-Path ".\publish\svc").Path
+          $dest   = $env:DEST
+          $svcName = $env:SERVICE_NAME
+          $mappedRoot = $null
+          if ($dest -like '\\*' -and $env:DEPLOY_USER) {
+            $parts = $dest.TrimStart('\').Split('\'); $mappedRoot = "\\$($parts[0])\$($parts[1])"
+            net use $mappedRoot /user:$env:DEPLOY_USER $env:DEPLOY_PASSWORD | Out-Null
+          }
+          try {
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+            # Stop the service so its binaries can be replaced.
+            $svcObj = $null
+            if ($svcName) { $svcObj = Get-Service -Name $svcName -ErrorAction SilentlyContinue }
+            if ($svcObj -and $svcObj.Status -ne 'Stopped') {
+              Write-Host "Stopping service $svcName ..."
+              Stop-Service -Name $svcName -Force
+              (Get-Service -Name $svcName).WaitForStatus('Stopped', '00:01:00')
+            }
+
+            $excludeFiles = $env:EXCLUDE_FILES -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+            $excludeDirs  = $env:EXCLUDE_DIRS  -split '[\r\n,;]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ } | ForEach-Object { Join-Path $dest $_ }
+            $roboArgs = @('/MIR','/NFL','/NDL','/NJH','/NJS','/NP','/R:3','/W:5')
+            if ($excludeFiles) { $roboArgs += '/XF'; $roboArgs += $excludeFiles }
+            if ($excludeDirs)  { $roboArgs += '/XD'; $roboArgs += $excludeDirs }
+            robocopy $source $dest @roboArgs
+            if ($LASTEXITCODE -ge 8) { throw "robocopy failed for $dest (exit $LASTEXITCODE)" }
+
+            # Restart the service if we stopped it (or it exists).
+            if ($svcObj) {
+              Write-Host "Starting service $svcName ..."
+              Start-Service -Name $svcName
+            }
+            Write-Host "Deployed Windows Service to $dest"
+          }
+          finally { if ($mappedRoot) { net use $mappedRoot /delete /y | Out-Null } }
+          exit 0
