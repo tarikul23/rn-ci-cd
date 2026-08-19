@@ -1,11 +1,7 @@
 name: Deploy Applications (CD - Manual)
 
-# Manual run: "<branch> / <application> by <actor>". Automatic (post-CI) run:
-# just reports what changed and waits for a human to start the deploy.
-run-name: >-
-  ${{ github.event_name == 'workflow_dispatch'
-      && format('CD manual → {0} / {1} by {2}', inputs.target, inputs.application, github.actor)
-      || format('CD check → {0}: {1}', github.event.workflow_run.head_branch, github.event.workflow_run.display_title) }}
+# Run title: "<target branch> / <application> by <actor>".
+run-name: CD → ${{ inputs.target }} / ${{ inputs.application }} by ${{ github.actor }}
 
 # ---------------------------------------------------------------------------
 # Continuous Deployment WITHOUT GitHub "Deployment protection rules".
@@ -15,10 +11,10 @@ run-name: >-
 # This workflow keeps the "nothing ships until a human says so" property using
 # only features available on every plan:
 #
-#   1. NOTHING deploys automatically. A successful CI run only *reports* which
-#      applications changed (job `report`) and links to the deploy button.
-#   2. Deploying requires a deliberate `workflow_dispatch` — the manual run IS
-#      the approval, and GitHub records who pressed it in the run metadata.
+#   1. There is NO automatic trigger. This workflow never starts on its own —
+#      not on push, and not after CI. It exists only behind "Run workflow".
+#   2. That deliberate `workflow_dispatch` IS the approval, and GitHub records
+#      who pressed it in the run metadata.
 #   3. The `gate` job hardens that press:
 #        - the operator picks the target branch from a fixed list
 #        - the operator must type that branch name into `confirm`
@@ -32,14 +28,14 @@ run-name: >-
 # Environments are still used (web-dev, api-staging, ...) but ONLY as the
 # holder of the deploy-path variables — no protection rule required.
 #
-# Flow:
-#   CI success ──► report (summary only, no deploy)
+# Flow (starts only when a human presses "Run workflow"):
+#   gate ─┬─ publish-web ─ deploy-web   (Dashboard Web)
+#         ├─ publish-api ─ deploy-api   (MJH API)
+#         ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
+#         └─ publish-svc ─ deploy-svc   (Windows Service)
 #
-#   human presses "Run workflow"
-#        └─ gate ─┬─ publish-web ─ deploy-web   (Dashboard Web)
-#                 ├─ publish-api ─ deploy-api   (MJH API)
-#                 ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
-#                 └─ publish-svc ─ deploy-svc   (Windows Service)
+# CI (build-and-test.yml) still runs on every push — it just no longer starts
+# anything here. Check CI is green before you deploy.
 #
 # SETUP: add a repository VARIABLE (Settings -> Secrets and variables ->
 # Actions -> Variables):
@@ -53,14 +49,8 @@ run-name: >-
 # ---------------------------------------------------------------------------
 
 on:
-  # Post-CI: report only. Never deploys.
-  # NOTE: must match the CI workflow's `name:` exactly.
-  workflow_run:
-    workflows: ["Build & Test (CI)"]
-    types: [completed]
-    branches: [dev, staging, hotfix]
-
-  # The approval. Launch it from any branch (main is fine) and pick the target.
+  # Manual only — this is the single trigger, and pressing it is the approval.
+  # Launch it from any branch (main is fine) and pick the target below.
   workflow_dispatch:
     inputs:
       target:
@@ -93,7 +83,7 @@ on:
 
 concurrency:
   # One in-flight deploy per target branch; never interrupt an active deploy.
-  group: cd-${{ github.event.inputs.target || github.event.workflow_run.head_branch || github.ref_name }}
+  group: cd-${{ github.event.inputs.target }}
   cancel-in-progress: false
 
 permissions:
@@ -120,77 +110,11 @@ env:
 
 jobs:
   # =========================================================================
-  # A. POST-CI REPORT — runs after a green CI build. Deploys NOTHING; it only
-  #    tells you which applications are pending and how to release them.
-  # =========================================================================
-  report:
-    name: Pending deployment report (${{ github.event.workflow_run.head_branch }})
-    if: >-
-      github.event_name == 'workflow_run' &&
-      github.event.workflow_run.conclusion == 'success'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0   # full history so we can diff against the parent commit
-          ref: ${{ github.event.workflow_run.head_sha }}
-
-      - name: Summarise what is waiting to be deployed
-        shell: bash
-        env:
-          BRANCH:   ${{ github.event.workflow_run.head_branch }}
-          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          TITLE:    ${{ github.event.workflow_run.display_title }}
-          RUN_URL:  ${{ github.server_url }}/${{ github.repository }}/actions/workflows/deploy-applications-manual.yml
-        run: |
-          set -euo pipefail
-          BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo '')"
-          apps=""
-          if [ -z "$BASE_SHA" ]; then
-            apps="dashboard-web mjh-api dashboard-sso windows-service (first commit)"
-          else
-            CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
-            echo "Changed files:"; echo "$CHANGED"
-            domain=false
-            echo "$CHANGED" | grep -q '^Domain/'         && domain=true                  || true
-            echo "$CHANGED" | grep -q '^mvc web/'        && apps="$apps dashboard-web"   || true
-            echo "$CHANGED" | grep -q '^web api/'        && apps="$apps mjh-api"         || true
-            echo "$CHANGED" | grep -q '^SSO/'            && apps="$apps dashboard-sso"   || true
-            echo "$CHANGED" | grep -q '^WindowsService/' && apps="$apps windows-service" || true
-            # Shared Domain project -> all four applications are pending.
-            if [ "$domain" = "true" ]; then
-              apps="dashboard-web mjh-api dashboard-sso windows-service (Domain changed)"
-            fi
-          fi
-          apps="$(echo "$apps" | sed 's/^ *//')"
-          [ -n "$apps" ] || apps="(nothing deployable changed)"
-
-          {
-            echo "## Awaiting manual approval"
-            echo
-            echo "CI passed on **$BRANCH** — nothing has been deployed."
-            echo
-            echo "| | |"
-            echo "| --- | --- |"
-            echo "| Branch | $BRANCH |"
-            echo "| Commit | ${HEAD_SHA:0:8} — $TITLE |"
-            echo "| Pending applications | $apps |"
-            echo
-            echo "### To deploy"
-            echo "1. Open [Deploy Applications (CD - Manual)]($RUN_URL)"
-            echo "2. **Run workflow** -> branch $BRANCH"
-            echo "3. Pick the application, type $BRANCH in *confirm*, press **Run workflow**"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "::notice::CI green on $BRANCH. Pending: $apps. Deployment is manual."
-
-  # =========================================================================
-  # B. GATE — this job IS the approval. Only reached via workflow_dispatch.
+  # GATE — this job IS the approval: it validates the target, the typed
+  # confirmation and the operator, then pins the commit to be deployed.
   # =========================================================================
   gate:
     name: Approval gate (${{ inputs.target }})
-    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       web: ${{ steps.decide.outputs.web }}
