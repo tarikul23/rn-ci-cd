@@ -144,6 +144,11 @@ jobs:
       # Exact commit every publish job builds — pinned here so all four lanes
       # ship the same code even if someone pushes mid-deploy.
       sha: ${{ steps.decide.outputs.sha }}
+      # Commit subject + author of that commit. `run-name` cannot use these
+      # (it is evaluated before any job runs, and a workflow_dispatch payload
+      # has no commit message), but job names and summaries can.
+      title: ${{ steps.decide.outputs.title }}
+      author: ${{ steps.decide.outputs.author }}
     steps:
       # -- input validation: not an approval gate, just two cheap guards -------
       - name: Validate request
@@ -190,6 +195,10 @@ jobs:
           set -euo pipefail
           web=false; api=false; sso=false; svc=false
           SHA="$(git rev-parse HEAD)"
+          # Commit subject, trimmed so it cannot blow up a job name or a table
+          # row, and with '|' neutralised for Markdown.
+          TITLE="$(git log -1 --pretty=%s | cut -c1-72 | tr -d '\r' | sed 's/|/\\|/g')"
+          AUTHOR="$(git log -1 --pretty=%an)"
 
           case "$BRANCH" in
             dev|staging|hotfix) ;;
@@ -247,6 +256,16 @@ jobs:
             echo "environment=$BRANCH"
             echo "sha=$SHA"
           } >> "$GITHUB_OUTPUT"
+
+          # Delimited form: a commit subject can contain anything.
+          {
+            echo "title<<__CD_EOT__"
+            echo "$TITLE"
+            echo "__CD_EOT__"
+            echo "author<<__CD_EOT__"
+            echo "$AUTHOR"
+            echo "__CD_EOT__"
+          } >> "$GITHUB_OUTPUT"
           echo "::notice::branch=$BRANCH sha=${SHA:0:8} apps=$apps"
 
           if [ "$any" = "false" ]; then
@@ -267,7 +286,8 @@ jobs:
             echo "| --- | --- |"
             echo "| Started by | @$GITHUB_ACTOR |"
             echo "| Branch | $BRANCH |"
-            echo "| Commit | ${SHA:0:8} |"
+            echo "| Commit | \`${SHA:0:8}\` — $TITLE |"
+            echo "| Commit author | $AUTHOR |"
             echo "| Selection | $SELECTION |"
             echo "| Applications | $apps |"
             echo "| Reason | ${REASON:-(none)} |"
@@ -279,7 +299,7 @@ jobs:
   # The environment is attached only to supply the deploy-path variable.
   # =========================================================================
   publish-web:
-    name: Publish Dashboard Web
+    name: Publish Web — ${{ needs.detect-changes.outputs.title }}
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.web == 'true'
@@ -308,7 +328,7 @@ jobs:
           retention-days: 7
 
   publish-api:
-    name: Publish MJH API
+    name: Publish API — ${{ needs.detect-changes.outputs.title }}
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.api == 'true'
@@ -337,7 +357,7 @@ jobs:
           retention-days: 7
 
   publish-sso:
-    name: Publish Dashboard SSO
+    name: Publish SSO — ${{ needs.detect-changes.outputs.title }}
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.sso == 'true'
@@ -366,7 +386,7 @@ jobs:
           retention-days: 7
 
   publish-svc:
-    name: Publish Windows Service
+    name: Publish SVC — ${{ needs.detect-changes.outputs.title }}
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.svc == 'true'
