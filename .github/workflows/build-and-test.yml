@@ -23,6 +23,10 @@ on:
     branches: [dev, staging, hotfix]
     paths-ignore:
       - '.github/workflows/**'
+  # Run CI by hand on a branch. A dispatched run still emits the `workflow_run`
+  # event, so this is how you exercise the CI -> CD chain without pushing code
+  # (a workflow-only commit is ignored by the paths-ignore filters above).
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:

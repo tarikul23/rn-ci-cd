@@ -1,57 +1,102 @@
-name: Auto Deploy Applications (CD)
+name: Deploy Applications (CD - Manual Approval)
 
-# Show the branch + the title/commit that triggered CI (or the actor for a
-# manual run) in the Actions run list.
+# Run title: "<target branch> — ticked apps — by <actor>".
 run-name: >-
-  CD → ${{ github.event.workflow_run.head_branch || github.ref_name }}:
-  ${{ github.event.workflow_run.display_title || format('manual by {0}', github.actor) }}
+  CD → ${{ inputs.target }} —
+  ${{ inputs.deploy_web && 'web ' || '' }}${{ inputs.deploy_api && 'api ' || '' }}${{ inputs.deploy_sso && 'sso ' || '' }}${{ inputs.deploy_svc && 'svc ' || '' }}${{ (inputs.deploy_web || inputs.deploy_api || inputs.deploy_sso || inputs.deploy_svc) && '' || 'changed-only' }}
+  — by ${{ github.actor }}
 
 # ---------------------------------------------------------------------------
-# Continuous Deployment (multi-branch: dev / staging / hotfix)
+# Continuous Deployment WITHOUT GitHub "Deployment protection rules".
 #
-# Deploys four applications, each only when it changed:
-#   Dashboard Web    (mvc web/)          -> vars.WEB_DEPLOY_PATH
-#   MJH API          (web api/)          -> vars.API_DEPLOY_PATH
-#   Dashboard SSO    (SSO/)              -> vars.SSO_DEPLOY_PATH
-#   Windows Service  (WindowsService/)   -> vars.SVC_DEPLOY_PATH
+# WHY: Required reviewers is an Environments *protection rule*, unavailable on
+# private repos on the Free plan (and to non-admins). Instead of approving a
+# run that already started, NOTHING starts on its own: publishing is an act a
+# person performs. Pressing "Run workflow" IS the approval.
 #
-# A change in the shared Domain project redeploys ALL four apps.
+# HOW IT BEHAVES:
+#   CI succeeds  ──►  nothing happens here. Check CI is green, then deploy.
 #
-# Each app+branch uses its OWN GitHub Environment (reviewers + deploy-path
-# variable), and the environment is attached to the PUBLISH job — so a
-# reviewer approves BEFORE the build runs. The deploy job then reads the path
-# from the publish job's output and credentials from repository secrets.
-#   web-dev  api-dev  sso-dev  svc-dev
-#   web-staging  api-staging  sso-staging  svc-staging
-#   web-hotfix   api-hotfix   sso-hotfix   svc-hotfix
+#   You press "Run workflow" (target branch + app checkboxes + confirm)
+#     └─ detect-changes ─┬─ publish-web ─ deploy-web   (Dashboard Web)
+#                        ├─ publish-api ─ deploy-api   (MJH API)
+#                        ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
+#                        └─ publish-svc ─ deploy-svc   (Windows Service)
 #
-# Flow (four independent lanes; [approve] gates BEFORE publish):
-#   detect-changes ─┬─ [approve] publish-web ─ deploy-web   (Dashboard Web)
-#                   ├─ [approve] publish-api ─ deploy-api   (MJH API)
-#                   ├─ [approve] publish-sso ─ deploy-sso   (Dashboard SSO)
-#                   └─ [approve] publish-svc ─ deploy-svc   (Windows Service)
+# There is no automatic trigger, so no build is ever packaged and no file is
+# ever copied to a server without someone deliberately starting it. GitHub
+# records who pressed the button in the run metadata.
+#
+# Two cheap guards on that press (they are input validation, not a gate job —
+# say the word if you want them gone too):
+#   - the operator retypes the target branch name into `confirm`
+#   - the operator must be listed in the repo variable CD_APPROVERS
+#
+# Environments (web-dev, api-staging, ...) are still used, but ONLY to hold the
+# deploy-path variables — no protection rule required.
+#
+# ---------------------------------------------------------------------------
+# SETUP
+#   Repo VARIABLE (Settings -> Secrets and variables -> Actions -> Variables):
+#     CD_APPROVERS   comma-separated GitHub logins allowed to deploy, e.g.
+#                    "tarikul23,team-lead-login". If EMPTY, anyone with write
+#                    access can deploy and the run only logs a warning.
+#
+#   The file must live on the DEFAULT branch for the Run workflow button to
+#   appear. The branch you launch from does not matter — `target` decides what
+#   is built.
+#
+# HONEST LIMIT: anyone with write access can edit this file, and the branch
+# selector is only as safe as the branches themselves. Protect dev/staging/
+# hotfix with a branch ruleset requiring PR review for `.github/**`.
 # ---------------------------------------------------------------------------
 
 on:
-  # Run only after CI finished successfully on one of these branches.
-  # NOTE: this must match the CI workflow's `name:` exactly.
-  workflow_run:
-    workflows: ["Build & Test (CI)"]
-    types: [completed]
-    branches: [dev, staging, hotfix]
-  # Manual trigger: force-deploy ONE application on the branch you run it from.
+  # Manual only — this is the single trigger, and pressing it is the approval.
+  # Launch from any branch (main is fine) and pick the target below.
   workflow_dispatch:
     inputs:
-      application:
-        description: 'Application to deploy'
+      target:
+        description: 'Branch to deploy (this is what gets built & shipped)'
         required: true
-        default: 'dashboard-web'
+        default: 'dev'
         type: choice
-        options: [dashboard-web, mjh-api, dashboard-sso, windows-service]
+        options: [dev, staging, hotfix]
+      # Tick any combination. Leave ALL FOUR unticked to fall back to
+      # "changed-only": deploy whatever the branch head's commit touched.
+      deploy_web:
+        description: 'Dashboard Web   (mvc web/)'
+        required: false
+        default: false
+        type: boolean
+      deploy_api:
+        description: 'MJH API   (web api/)'
+        required: false
+        default: false
+        type: boolean
+      deploy_sso:
+        description: 'Dashboard SSO   (SSO/)'
+        required: false
+        default: false
+        type: boolean
+      deploy_svc:
+        description: 'Windows Service   (WindowsService/)'
+        required: false
+        default: false
+        type: boolean
+      confirm:
+        description: 'Type the target branch name again to confirm'
+        required: true
+        type: string
+      reason:
+        description: 'Why are you deploying? (shown in the run summary)'
+        required: false
+        default: 'manual deployment'
+        type: string
 
 concurrency:
-  # One in-flight deploy per branch; never interrupt an active deploy.
-  group: cd-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  # One in-flight deploy per target branch; never interrupt an active deploy.
+  group: cd-${{ github.event.inputs.target }}
   cancel-in-progress: false
 
 permissions:
@@ -77,91 +122,173 @@ env:
   DOTNET_NOLOGO: 'true'
 
 jobs:
-  # -------------------------------------------------------------------------
-  # 0. DETECT CHANGES + TARGET BRANCH.
-  #    Sets a deploy flag per application and the environment (= branch).
+  # =========================================================================
+  # 1. DETECT CHANGES + TARGET BRANCH.
+  #    Sets a deploy flag per application, the branch (= environment suffix)
+  #    and the exact commit every lane will build.
   #    A Domain/** change fans out to ALL four applications.
-  # -------------------------------------------------------------------------
+  # =========================================================================
   detect-changes:
-    # This job always runs, so its name reliably shows the branch — even when
-    # every deploy lane is skipped or a publish is rejected.
-    name: Detect changes & target (${{ github.event.workflow_run.head_branch || github.ref_name }})
+    # Always runs, so its name reliably shows the branch even when every deploy
+    # lane is skipped.
+    name: Detect changes & target (${{ inputs.target }})
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     outputs:
       web: ${{ steps.decide.outputs.web }}
       api: ${{ steps.decide.outputs.api }}
       sso: ${{ steps.decide.outputs.sso }}
       svc: ${{ steps.decide.outputs.svc }}
+      any: ${{ steps.decide.outputs.any }}
+      apps: ${{ steps.decide.outputs.apps }}
       environment: ${{ steps.decide.outputs.environment }}
+      # Exact commit every publish job builds — pinned here so all four lanes
+      # ship the same code even if someone pushes mid-deploy.
+      sha: ${{ steps.decide.outputs.sha }}
     steps:
-      - name: Checkout source
+      # -- input validation: not an approval gate, just two cheap guards -------
+      - name: Validate request
+        shell: bash
+        env:
+          BRANCH:    ${{ inputs.target }}
+          CONFIRM:   ${{ inputs.confirm }}
+          ACTOR:     ${{ github.actor }}
+          APPROVERS: ${{ vars.CD_APPROVERS }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRM" != "$BRANCH" ]; then
+            echo "::error::Confirmation mismatch — you typed '$CONFIRM', expected '$BRANCH'. Nothing was deployed."
+            exit 1
+          fi
+          if [ -z "${APPROVERS//[[:space:]]/}" ]; then
+            echo "::warning::Repo variable CD_APPROVERS is empty — anyone with write access can deploy."
+          elif printf '%s' "$APPROVERS" | tr ',;' '\n\n' | tr -d '[:space:]' | grep -Fqix "$ACTOR"; then
+            echo "Operator '$ACTOR' accepted."
+          else
+            echo "::error::'$ACTOR' is not listed in CD_APPROVERS. Ask an approver to run this deployment."
+            exit 1
+          fi
+
+      - name: Checkout target branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history so we can diff against the parent commit
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          # The TARGET branch, not the branch this run was launched from.
+          ref: refs/heads/${{ inputs.target }}
 
       - name: Decide applications & environment
         id: decide
         shell: bash
+        env:
+          BRANCH: ${{ inputs.target }}
+          REASON: ${{ inputs.reason }}
+          # Checkboxes arrive as the strings "true" / "false".
+          WEB_IN: ${{ inputs.deploy_web }}
+          API_IN: ${{ inputs.deploy_api }}
+          SSO_IN: ${{ inputs.deploy_sso }}
+          SVC_IN: ${{ inputs.deploy_svc }}
         run: |
           set -euo pipefail
           web=false; api=false; sso=false; svc=false
+          SHA="$(git rev-parse HEAD)"
+          # The commit that is actually being built. Trimmed so a long subject
+          # cannot wreck the table, with '|' neutralised for Markdown.
+          TITLE="$(git log -1 --pretty=%s | cut -c1-72 | tr -d '\r' | sed 's/|/\\|/g')"
+          AUTHOR="$(git log -1 --pretty=%an)"
+          WHEN="$(git log -1 --date=format:'%Y-%m-%d %H:%M' --pretty=%ad)"
 
-          # Branch that triggered CI (auto) or that dispatch was run from (manual).
-          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
-          echo "Target branch / environment: $BRANCH"
+          case "$BRANCH" in
+            dev|staging|hotfix) ;;
+            *) echo "::error::'$BRANCH' is not deployable. Use dev, staging or hotfix."; exit 1 ;;
+          esac
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            # Manual run: operator deploys exactly ONE application.
-            case "${{ github.event.inputs.application }}" in
-              dashboard-web)   web=true ;;
-              mjh-api)         api=true ;;
-              dashboard-sso)   sso=true ;;
-              windows-service) svc=true ;;
-            esac
-          else
-            # Auto run: diff the pushed commit against its first parent.
-            HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
-            BASE_SHA="$(git rev-parse "${HEAD_SHA}^" 2>/dev/null || echo '')"
+          # Ticked boxes win outright — no diffing, deploy exactly what was asked.
+          [ "$WEB_IN" = "true" ] && web=true || true
+          [ "$API_IN" = "true" ] && api=true || true
+          [ "$SSO_IN" = "true" ] && sso=true || true
+          [ "$SVC_IN" = "true" ] && svc=true || true
+
+          if [ "$web$api$sso$svc" = "falsefalsefalsefalse" ]; then
+            # Nothing ticked -> fall back to what the head commit touched.
+            SELECTION="changed-only (nothing ticked)"
+            BASE_SHA="$(git rev-parse 'HEAD^' 2>/dev/null || echo '')"
             if [ -z "$BASE_SHA" ]; then
               web=true; api=true; sso=true; svc=true   # first commit -> deploy all
             else
-              CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+              CHANGED="$(git diff --name-only "$BASE_SHA" HEAD)"
               echo "Changed files:"; echo "$CHANGED"
-
               domain=false
               echo "$CHANGED" | grep -q '^Domain/'         && domain=true || true
               echo "$CHANGED" | grep -q '^mvc web/'        && web=true    || true
               echo "$CHANGED" | grep -q '^web api/'        && api=true    || true
               echo "$CHANGED" | grep -q '^SSO/'            && sso=true    || true
               echo "$CHANGED" | grep -q '^WindowsService/' && svc=true    || true
-
               # Shared Domain project -> redeploy ALL four applications.
               if [ "$domain" = "true" ]; then web=true; api=true; sso=true; svc=true; fi
             fi
+          else
+            SELECTION="explicitly ticked"
           fi
+          echo "Target: $BRANCH @ $SHA (selection: $SELECTION)"
+
+          any=true
+          [ "$web$api$sso$svc" = "falsefalsefalsefalse" ] && any=false || true
+
+          # Human-readable list for the run summary.
+          apps=""
+          [ "$web" = "true" ] && apps="$apps Dashboard Web,"   || true
+          [ "$api" = "true" ] && apps="$apps MJH API,"         || true
+          [ "$sso" = "true" ] && apps="$apps Dashboard SSO,"   || true
+          [ "$svc" = "true" ] && apps="$apps Windows Service," || true
+          apps="$(echo "$apps" | sed 's/^ *//; s/,$//')"
+          [ -n "$apps" ] || apps="(none)"
 
           {
             echo "web=$web"
             echo "api=$api"
             echo "sso=$sso"
             echo "svc=$svc"
+            echo "any=$any"
+            echo "apps=$apps"
             echo "environment=$BRANCH"
+            echo "sha=$SHA"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::branch=$BRANCH web=$web api=$api sso=$sso svc=$svc"
+          echo "::notice::branch=$BRANCH sha=${SHA:0:8} apps=$apps"
+
+          if [ "$any" = "false" ]; then
+            {
+              echo "## Nothing to deploy"
+              echo
+              echo "Commit \`${SHA:0:8}\` — $TITLE — on \`$BRANCH\` touched no deployable application."
+              echo "Tick the application you want on the Run workflow form to force one out regardless of the diff."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Nothing to deploy — the last commit on $BRANCH touched no application."
+            exit 1
+          fi
+
+          {
+            echo "## Deploying"
+            echo
+            echo "| | |"
+            echo "| --- | --- |"
+            echo "| Started by | @$GITHUB_ACTOR |"
+            echo "| Branch | $BRANCH |"
+            echo "| Commit | \`${SHA:0:8}\` — $TITLE |"
+            echo "| Committed by | $AUTHOR on $WHEN |"
+            echo "| Selection | $SELECTION |"
+            echo "| Applications | $apps |"
+            echo "| Reason | ${REASON:-(none)} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
-  # PUBLISH LANES — build & package each changed application independently.
+  # PUBLISH LANES — build & package each selected application independently.
+  # Reached only because a human pressed "Run workflow" and passed validation.
+  # The environment is attached only to supply the deploy-path variable.
   # =========================================================================
   publish-web:
     name: Publish Dashboard Web
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.web == 'true'
-    # Approval gate: reviewers on this environment sign off BEFORE the build.
     environment: web-${{ needs.detect-changes.outputs.environment }}
     outputs:
       deploy_path: ${{ steps.cfg.outputs.deploy_path }}
@@ -172,7 +299,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          ref: ${{ needs.detect-changes.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -201,7 +328,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          ref: ${{ needs.detect-changes.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -230,7 +357,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          ref: ${{ needs.detect-changes.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -262,7 +389,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          ref: ${{ needs.detect-changes.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -277,9 +404,8 @@ jobs:
           retention-days: 7
 
   # =========================================================================
-  # DEPLOY LANES — self-hosted Windows runner. Approval already happened at the
-  # publish stage; the deploy path comes from that job's output, credentials
-  # from repository secrets.
+  # DEPLOY LANES — self-hosted Windows runner. The deploy path comes from the
+  # publish job's output, credentials from repository secrets.
   # =========================================================================
   deploy-web:
     name: Deploy Web
