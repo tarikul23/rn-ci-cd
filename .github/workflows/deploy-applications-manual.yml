@@ -144,11 +144,6 @@ jobs:
       # Exact commit every publish job builds — pinned here so all four lanes
       # ship the same code even if someone pushes mid-deploy.
       sha: ${{ steps.decide.outputs.sha }}
-      # Commit subject + author of that commit. `run-name` cannot use these
-      # (it is evaluated before any job runs, and a workflow_dispatch payload
-      # has no commit message), but job names and summaries can.
-      title: ${{ steps.decide.outputs.title }}
-      author: ${{ steps.decide.outputs.author }}
     steps:
       # -- input validation: not an approval gate, just two cheap guards -------
       - name: Validate request
@@ -195,10 +190,11 @@ jobs:
           set -euo pipefail
           web=false; api=false; sso=false; svc=false
           SHA="$(git rev-parse HEAD)"
-          # Commit subject, trimmed so it cannot blow up a job name or a table
-          # row, and with '|' neutralised for Markdown.
+          # The commit that is actually being built. Trimmed so a long subject
+          # cannot wreck the table, with '|' neutralised for Markdown.
           TITLE="$(git log -1 --pretty=%s | cut -c1-72 | tr -d '\r' | sed 's/|/\\|/g')"
           AUTHOR="$(git log -1 --pretty=%an)"
+          WHEN="$(git log -1 --date=format:'%Y-%m-%d %H:%M' --pretty=%ad)"
 
           case "$BRANCH" in
             dev|staging|hotfix) ;;
@@ -256,23 +252,13 @@ jobs:
             echo "environment=$BRANCH"
             echo "sha=$SHA"
           } >> "$GITHUB_OUTPUT"
-
-          # Delimited form: a commit subject can contain anything.
-          {
-            echo "title<<__CD_EOT__"
-            echo "$TITLE"
-            echo "__CD_EOT__"
-            echo "author<<__CD_EOT__"
-            echo "$AUTHOR"
-            echo "__CD_EOT__"
-          } >> "$GITHUB_OUTPUT"
           echo "::notice::branch=$BRANCH sha=${SHA:0:8} apps=$apps"
 
           if [ "$any" = "false" ]; then
             {
               echo "## Nothing to deploy"
               echo
-              echo "Commit \`${SHA:0:8}\` on \`$BRANCH\` touched no deployable application."
+              echo "Commit \`${SHA:0:8}\` — $TITLE — on \`$BRANCH\` touched no deployable application."
               echo "Tick the application you want on the Run workflow form to force one out regardless of the diff."
             } >> "$GITHUB_STEP_SUMMARY"
             echo "::error::Nothing to deploy — the last commit on $BRANCH touched no application."
@@ -287,7 +273,7 @@ jobs:
             echo "| Started by | @$GITHUB_ACTOR |"
             echo "| Branch | $BRANCH |"
             echo "| Commit | \`${SHA:0:8}\` — $TITLE |"
-            echo "| Commit author | $AUTHOR |"
+            echo "| Committed by | $AUTHOR on $WHEN |"
             echo "| Selection | $SELECTION |"
             echo "| Applications | $apps |"
             echo "| Reason | ${REASON:-(none)} |"
@@ -299,7 +285,7 @@ jobs:
   # The environment is attached only to supply the deploy-path variable.
   # =========================================================================
   publish-web:
-    name: Publish Web — ${{ needs.detect-changes.outputs.title }}
+    name: Publish Dashboard Web
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.web == 'true'
@@ -328,7 +314,7 @@ jobs:
           retention-days: 7
 
   publish-api:
-    name: Publish API — ${{ needs.detect-changes.outputs.title }}
+    name: Publish MJH API
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.api == 'true'
@@ -357,7 +343,7 @@ jobs:
           retention-days: 7
 
   publish-sso:
-    name: Publish SSO — ${{ needs.detect-changes.outputs.title }}
+    name: Publish Dashboard SSO
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.sso == 'true'
@@ -386,7 +372,7 @@ jobs:
           retention-days: 7
 
   publish-svc:
-    name: Publish SVC — ${{ needs.detect-changes.outputs.title }}
+    name: Publish Windows Service
     needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.svc == 'true'
