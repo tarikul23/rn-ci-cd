@@ -32,9 +32,10 @@ run-name: >-
 # Deploying without that comment is impossible: every publish job `needs:
 # approve`, and a job whose dependency failed or timed out never starts.
 #
-# workflow_dispatch is kept as a force-deploy path. There the approval is the
-# press itself, so no issue is opened — but the operator must still retype the
-# branch name and be listed in CD_APPROVERS.
+# workflow_dispatch is kept as a force-deploy path, and it is gated the SAME
+# way: the operator retypes the branch name and must be in CD_APPROVERS, and
+# then the run still opens an approval issue and waits for a comment. There is
+# no path to publish that skips the issue — not even your own force-deploy.
 #
 # Environments (web-dev, api-staging, ...) are still used, but ONLY to hold the
 # deploy-path variables — no protection rule required.
@@ -251,10 +252,10 @@ jobs:
   # =========================================================================
   # 2. APPROVAL GATE — the run STOPS here until a human answers.
   #
-  #    Auto (post-CI) runs: opens an issue and polls it for an "approve" or
-  #    "deny" comment from an authorised approver.
-  #    Manual runs: the dispatch is the approval; only the typed confirmation
-  #    and the approver allowlist are checked.
+  #    EVERY run — automatic or force-dispatched — opens an issue and polls it
+  #    for an "approve" or "deny" comment from an authorised approver. A manual
+  #    dispatch additionally has its typed confirmation and its operator checked
+  #    before the issue is even opened.
   #
   #    Every publish job `needs: approve`, so a denial, a timeout or a
   #    cancellation means nothing is ever built or copied to a server.
@@ -271,7 +272,9 @@ jobs:
       contents: read
       issues: write
     steps:
-      # -- MANUAL PATH: the operator pressed "Run workflow" -------------------
+      # -- DISPATCH PRE-CHECK: reject a bad force-deploy before opening an
+      #    issue for it. This does NOT approve anything — the wait below still
+      #    runs, so a force-deploy needs a comment like any other run.
       - name: Validate manual dispatch
         if: github.event_name == 'workflow_dispatch'
         shell: bash
@@ -298,20 +301,22 @@ jobs:
             exit 1
           fi
           {
-            echo "## Deployment approved (manual dispatch)"
+            echo "## Manual dispatch accepted — awaiting approval"
             echo
             echo "| | |"
             echo "| --- | --- |"
-            echo "| Approved by | @$ACTOR |"
+            echo "| Requested by | @$ACTOR |"
             echo "| Branch | $BRANCH |"
             echo "| Commit | ${SHA:0:8} |"
             echo "| Applications | $APPS |"
             echo "| Reason | $REASON |"
+            echo
+            echo "Pressing *Run workflow* is not the approval — an approval issue follows."
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # -- AUTO PATH: hold the run open until someone answers -----------------
+      # -- HOLD THE RUN OPEN until someone answers. Runs on EVERY event, so a
+      #    force-dispatch is gated exactly like an automatic post-CI run.
       - name: Wait for approval
-        if: github.event_name == 'workflow_run'
         shell: bash
         env:
           GH_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
@@ -319,8 +324,12 @@ jobs:
           BRANCH:       ${{ needs.detect-changes.outputs.environment }}
           SHA:          ${{ needs.detect-changes.outputs.sha }}
           APPS:         ${{ needs.detect-changes.outputs.apps }}
-          TITLE:        ${{ github.event.workflow_run.display_title }}
-          TRIGGERED_BY: ${{ github.event.workflow_run.actor.login }}
+          # On a dispatch there is no CI commit title / actor to inherit, so
+          # fall back to the operator who pressed the button.
+          TITLE:        ${{ github.event.workflow_run.display_title || format('force-deploy requested by {0}', github.actor) }}
+          TRIGGERED_BY: ${{ github.event.workflow_run.actor.login || github.actor }}
+          REASON:       ${{ inputs.reason }}
+          EVENT:        ${{ github.event_name }}
           RUN_URL:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           APPROVERS:    ${{ vars.CD_APPROVERS }}
           TIMEOUT_MIN:  ${{ vars.CD_APPROVAL_TIMEOUT_MINUTES || '60' }}
@@ -345,6 +354,14 @@ jobs:
           [ -n "$mentions" ] || mentions=" anyone with write access to this repository"
 
           # --- open the approval issue ---------------------------------------
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            kind="Force-deploy (manual dispatch)"
+            tag="force-deploy"
+          else
+            kind="Automatic, after a green CI run"
+            tag="post-CI"
+          fi
+
           {
             echo "### Deployment awaiting approval"
             echo
@@ -352,8 +369,10 @@ jobs:
             echo "| --- | --- |"
             echo "| Branch | \`$BRANCH\` |"
             echo "| Commit | \`${SHA:0:8}\` — $TITLE |"
-            echo "| Triggered by | @$TRIGGERED_BY |"
+            echo "| Requested by | @$TRIGGERED_BY |"
             echo "| Applications | $APPS |"
+            echo "| Kind | $kind |"
+            [ "$EVENT" = "workflow_dispatch" ] && echo "| Reason given | ${REASON:-(none)} |"
             echo "| Workflow run | [open the run]($RUN_URL) |"
             echo
             echo "The deployment is **paused** and will stay paused for up to **$TIMEOUT_MIN minutes**."
@@ -368,7 +387,7 @@ jobs:
           } > /tmp/approval-body.md
 
           issue_url="$(gh issue create --repo "$REPO" \
-            --title "Deploy $BRANCH @ ${SHA:0:8} — approval required ($APPS)" \
+            --title "[$tag] Deploy $BRANCH @ ${SHA:0:8} — approval required ($APPS)" \
             --body-file /tmp/approval-body.md)"
           issue_num="${issue_url##*/}"
           echo "::notice::Approval required — $issue_url"
