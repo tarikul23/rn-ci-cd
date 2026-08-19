@@ -1,4 +1,4 @@
-name: Deploy Applications (CD - Manual Approval)
+name: Deploy Applications (CD - Manually)
 
 # Run title: "<target branch> — ticked apps — by <actor>".
 run-name: >-
