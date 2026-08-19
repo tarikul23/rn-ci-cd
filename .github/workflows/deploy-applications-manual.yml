@@ -1,79 +1,56 @@
 name: Deploy Applications (CD - Manual Approval)
 
-# Auto run: "<branch>: <commit title>". Forced manual run: "... (manual by X)".
-run-name: >-
-  ${{ github.event_name == 'workflow_dispatch'
-      && format('CD → {0} / {1} (manual by {2})', inputs.target, inputs.application, github.actor)
-      || format('CD → {0}: {1}', github.event.workflow_run.head_branch, github.event.workflow_run.display_title) }}
+# Run title: "<target branch> / <application> by <actor>".
+run-name: CD → ${{ inputs.target }} / ${{ inputs.application }} by ${{ github.actor }}
 
 # ---------------------------------------------------------------------------
 # Continuous Deployment WITHOUT GitHub "Deployment protection rules".
 #
 # WHY: Required reviewers is an Environments *protection rule*, unavailable on
-# private repos on the Free plan (and to non-admins). GitHub therefore cannot
-# natively pause a run and wait for a reviewer — so this workflow builds that
-# pause itself.
+# private repos on the Free plan (and to non-admins). Instead of approving a
+# run that already started, NOTHING starts on its own: publishing is an act a
+# person performs. Pressing "Run workflow" IS the approval.
 #
-# HOW IT BEHAVES (this is the important part):
-#   CI succeeds  ──►  this workflow starts AUTOMATICALLY
-#                     └─ detect-changes  (which apps changed?)
-#                        └─ approve      [PAUSED] the run sits here and waits
-#                           │            it opens a GitHub Issue and polls it
-#                           │            until an approver comments
-#                           ├─ comment "approve" ──► publish + deploy continue
-#                           ├─ comment "deny"    ──► run fails, nothing ships
-#                           └─ nobody answers    ──► times out, nothing ships
+# HOW IT BEHAVES:
+#   CI succeeds  ──►  nothing happens here. Check CI is green, then deploy.
 #
-#   approve ─┬─ publish-web ─ deploy-web   (Dashboard Web)
-#            ├─ publish-api ─ deploy-api   (MJH API)
-#            ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
-#            └─ publish-svc ─ deploy-svc   (Windows Service)
+#   You press "Run workflow" (target branch + application + confirm)
+#     └─ detect-changes ─┬─ publish-web ─ deploy-web   (Dashboard Web)
+#                        ├─ publish-api ─ deploy-api   (MJH API)
+#                        ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
+#                        └─ publish-svc ─ deploy-svc   (Windows Service)
 #
-# Deploying without that comment is impossible: every publish job `needs:
-# approve`, and a job whose dependency failed or timed out never starts.
+# There is no automatic trigger, so no build is ever packaged and no file is
+# ever copied to a server without someone deliberately starting it. GitHub
+# records who pressed the button in the run metadata.
 #
-# workflow_dispatch is kept as a force-deploy path, and it is gated the SAME
-# way: the operator retypes the branch name and must be in CD_APPROVERS, and
-# then the run still opens an approval issue and waits for a comment. There is
-# no path to publish that skips the issue — not even your own force-deploy.
+# Two cheap guards on that press (they are input validation, not a gate job —
+# say the word if you want them gone too):
+#   - the operator retypes the target branch name into `confirm`
+#   - the operator must be listed in the repo variable CD_APPROVERS
 #
 # Environments (web-dev, api-staging, ...) are still used, but ONLY to hold the
 # deploy-path variables — no protection rule required.
 #
 # ---------------------------------------------------------------------------
 # SETUP
-#   Issues must be ENABLED on the repo (Settings -> General -> Features ->
-#   Issues); the approval gate IS an issue. The workflow checks and fails loud.
+#   Repo VARIABLE (Settings -> Secrets and variables -> Actions -> Variables):
+#     CD_APPROVERS   comma-separated GitHub logins allowed to deploy, e.g.
+#                    "tarikul23,team-lead-login". If EMPTY, anyone with write
+#                    access can deploy and the run only logs a warning.
 #
-#   Repo VARIABLES (Settings -> Secrets and variables -> Actions -> Variables):
-#     CD_APPROVERS                 comma-separated GitHub logins allowed to
-#                                  approve, e.g. "tarikul23,team-lead-login".
-#                                  If EMPTY, anyone with write access to the
-#                                  repo may approve (verified via the API).
-#     CD_APPROVAL_TIMEOUT_MINUTES  how long to wait before giving up.
-#                                  Default 60. Hard ceiling ~340.
-#     CD_BLOCK_SELF_APPROVAL       "true" = whoever triggered CI may not approve
-#                                  their own deploy (real two-person review).
-#                                  Default: self-approval allowed.
+#   The file must live on the DEFAULT branch for the Run workflow button to
+#   appear. The branch you launch from does not matter — `target` decides what
+#   is built.
 #
-# COST: the waiting job holds a hosted runner for as long as it waits, and on a
-# private repo those are billable minutes. Keep the timeout tight — waiting 60
-# minutes costs 60 Actions minutes even if nobody ever answers.
-#
-# HONEST LIMIT: this gate lives in the workflow file, so anyone with write
-# access could edit it away. Protect dev/staging/hotfix with a branch ruleset
-# requiring PR review for `.github/**` to close that hole.
+# HONEST LIMIT: anyone with write access can edit this file, and the branch
+# selector is only as safe as the branches themselves. Protect dev/staging/
+# hotfix with a branch ruleset requiring PR review for `.github/**`.
 # ---------------------------------------------------------------------------
 
 on:
-  # Automatic: fires when CI finishes on a deployable branch.
-  # NOTE: must match the CI workflow's `name:` exactly.
-  workflow_run:
-    workflows: ["Build & Test (CI)"]
-    types: [completed]
-    branches: [dev, staging, hotfix]
-
-  # Force-deploy path. Launch from any branch (main is fine) and pick a target.
+  # Manual only — this is the single trigger, and pressing it is the approval.
+  # Launch from any branch (main is fine) and pick the target below.
   workflow_dispatch:
     inputs:
       target:
@@ -99,14 +76,14 @@ on:
         required: true
         type: string
       reason:
-        description: 'Why are you force-deploying? (shown in the run summary)'
+        description: 'Why are you deploying? (shown in the run summary)'
         required: false
         default: 'manual deployment'
         type: string
 
 concurrency:
-  # One in-flight deploy per branch; never interrupt an active deploy.
-  group: cd-${{ github.event.inputs.target || github.event.workflow_run.head_branch }}
+  # One in-flight deploy per target branch; never interrupt an active deploy.
+  group: cd-${{ github.event.inputs.target }}
   cancel-in-progress: false
 
 permissions:
@@ -139,13 +116,10 @@ jobs:
   #    A Domain/** change fans out to ALL four applications.
   # =========================================================================
   detect-changes:
-    # Always runs, so its name reliably shows the branch even when every lane
-    # is skipped or the approval is denied.
-    name: Detect changes & target (${{ github.event.workflow_run.head_branch || inputs.target }})
+    # Always runs, so its name reliably shows the branch even when every deploy
+    # lane is skipped.
+    name: Detect changes & target (${{ inputs.target }})
     runs-on: ubuntu-latest
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.workflow_run.conclusion == 'success'
     outputs:
       web: ${{ steps.decide.outputs.web }}
       api: ${{ steps.decide.outputs.api }}
@@ -155,33 +129,49 @@ jobs:
       apps: ${{ steps.decide.outputs.apps }}
       environment: ${{ steps.decide.outputs.environment }}
       # Exact commit every publish job builds — pinned here so all four lanes
-      # ship the same code even if someone pushes during the approval wait.
+      # ship the same code even if someone pushes mid-deploy.
       sha: ${{ steps.decide.outputs.sha }}
     steps:
-      - name: Checkout source
+      # -- input validation: not an approval gate, just two cheap guards -------
+      - name: Validate request
+        shell: bash
+        env:
+          BRANCH:    ${{ inputs.target }}
+          CONFIRM:   ${{ inputs.confirm }}
+          ACTOR:     ${{ github.actor }}
+          APPROVERS: ${{ vars.CD_APPROVERS }}
+        run: |
+          set -euo pipefail
+          if [ "$CONFIRM" != "$BRANCH" ]; then
+            echo "::error::Confirmation mismatch — you typed '$CONFIRM', expected '$BRANCH'. Nothing was deployed."
+            exit 1
+          fi
+          if [ -z "${APPROVERS//[[:space:]]/}" ]; then
+            echo "::warning::Repo variable CD_APPROVERS is empty — anyone with write access can deploy."
+          elif printf '%s' "$APPROVERS" | tr ',;' '\n\n' | tr -d '[:space:]' | grep -Fqix "$ACTOR"; then
+            echo "Operator '$ACTOR' accepted."
+          else
+            echo "::error::'$ACTOR' is not listed in CD_APPROVERS. Ask an approver to run this deployment."
+            exit 1
+          fi
+
+      - name: Checkout target branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0   # full history so we can diff against the parent commit
-          # Auto run: the commit CI validated. Manual run: the chosen branch.
-          ref: ${{ github.event.workflow_run.head_sha || format('refs/heads/{0}', inputs.target) }}
+          # The TARGET branch, not the branch this run was launched from.
+          ref: refs/heads/${{ inputs.target }}
 
       - name: Decide applications & environment
         id: decide
         shell: bash
         env:
-          EVENT:       ${{ github.event_name }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-          TARGET:      ${{ inputs.target }}
-          APP:         ${{ inputs.application }}
+          BRANCH: ${{ inputs.target }}
+          SELECTION: ${{ inputs.application }}
+          REASON: ${{ inputs.reason }}
         run: |
           set -euo pipefail
           web=false; api=false; sso=false; svc=false
-
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            BRANCH="$TARGET"; SELECTION="$APP"
-          else
-            BRANCH="$HEAD_BRANCH"; SELECTION="changed-only"
-          fi
           SHA="$(git rev-parse HEAD)"
           echo "Target: $BRANCH @ $SHA (selection: $SELECTION)"
 
@@ -220,7 +210,7 @@ jobs:
           any=true
           [ "$web$api$sso$svc" = "falsefalsefalsefalse" ] && any=false || true
 
-          # Human-readable list for the approval issue.
+          # Human-readable list for the run summary.
           apps=""
           [ "$web" = "true" ] && apps="$apps Dashboard Web,"   || true
           [ "$api" = "true" ] && apps="$apps MJH API,"         || true
@@ -243,256 +233,36 @@ jobs:
 
           if [ "$any" = "false" ]; then
             {
-              echo "### Nothing to deploy"
+              echo "## Nothing to deploy"
               echo
-              echo "Commit ${SHA:0:8} on $BRANCH touched no deployable application."
+              echo "Commit \`${SHA:0:8}\` on \`$BRANCH\` touched no deployable application."
+              echo "Re-run and pick a specific application instead of \`changed-only\` if you meant to force one out."
             } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Nothing to deploy — the last commit on $BRANCH touched no application."
+            exit 1
           fi
 
-  # =========================================================================
-  # 2. APPROVAL GATE — the run STOPS here until a human answers.
-  #
-  #    EVERY run — automatic or force-dispatched — opens an issue and polls it
-  #    for an "approve" or "deny" comment from an authorised approver. A manual
-  #    dispatch additionally has its typed confirmation and its operator checked
-  #    before the issue is even opened.
-  #
-  #    Every publish job `needs: approve`, so a denial, a timeout or a
-  #    cancellation means nothing is ever built or copied to a server.
-  # =========================================================================
-  approve:
-    name: Approval gate (${{ needs.detect-changes.outputs.environment }})
-    needs: detect-changes
-    if: needs.detect-changes.outputs.any == 'true'
-    runs-on: ubuntu-latest
-    # Backstop only — the real deadline is CD_APPROVAL_TIMEOUT_MINUTES, enforced
-    # inside the script so it can close the issue and explain itself first.
-    timeout-minutes: 350
-    permissions:
-      contents: read
-      issues: write
-    steps:
-      # -- DISPATCH PRE-CHECK: reject a bad force-deploy before opening an
-      #    issue for it. This does NOT approve anything — the wait below still
-      #    runs, so a force-deploy needs a comment like any other run.
-      - name: Validate manual dispatch
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        env:
-          BRANCH:    ${{ needs.detect-changes.outputs.environment }}
-          CONFIRM:   ${{ inputs.confirm }}
-          ACTOR:     ${{ github.actor }}
-          APPROVERS: ${{ vars.CD_APPROVERS }}
-          REASON:    ${{ inputs.reason }}
-          APPS:      ${{ needs.detect-changes.outputs.apps }}
-          SHA:       ${{ needs.detect-changes.outputs.sha }}
-        run: |
-          set -euo pipefail
-          if [ "$CONFIRM" != "$BRANCH" ]; then
-            echo "::error::Confirmation mismatch — you typed '$CONFIRM', expected '$BRANCH'. Nothing was deployed."
-            exit 1
-          fi
-          if [ -z "${APPROVERS//[[:space:]]/}" ]; then
-            echo "::warning::Repo variable CD_APPROVERS is empty — anyone with write access can deploy."
-          elif printf '%s' "$APPROVERS" | tr ',;' '\n\n' | tr -d '[:space:]' | grep -Fqix "$ACTOR"; then
-            echo "Approver '$ACTOR' accepted."
-          else
-            echo "::error::'$ACTOR' is not listed in CD_APPROVERS. Ask an approver to run this deployment."
-            exit 1
-          fi
           {
-            echo "## Manual dispatch accepted — awaiting approval"
+            echo "## Deploying"
             echo
             echo "| | |"
             echo "| --- | --- |"
-            echo "| Requested by | @$ACTOR |"
+            echo "| Started by | @$GITHUB_ACTOR |"
             echo "| Branch | $BRANCH |"
             echo "| Commit | ${SHA:0:8} |"
-            echo "| Applications | $APPS |"
-            echo "| Reason | $REASON |"
-            echo
-            echo "Pressing *Run workflow* is not the approval — an approval issue follows."
+            echo "| Selection | $SELECTION |"
+            echo "| Applications | $apps |"
+            echo "| Reason | ${REASON:-(none)} |"
           } >> "$GITHUB_STEP_SUMMARY"
-
-      # -- HOLD THE RUN OPEN until someone answers. Runs on EVERY event, so a
-      #    force-dispatch is gated exactly like an automatic post-CI run.
-      - name: Wait for approval
-        shell: bash
-        env:
-          GH_TOKEN:     ${{ secrets.GITHUB_TOKEN }}
-          REPO:         ${{ github.repository }}
-          BRANCH:       ${{ needs.detect-changes.outputs.environment }}
-          SHA:          ${{ needs.detect-changes.outputs.sha }}
-          APPS:         ${{ needs.detect-changes.outputs.apps }}
-          # On a dispatch there is no CI commit title / actor to inherit, so
-          # fall back to the operator who pressed the button.
-          TITLE:        ${{ github.event.workflow_run.display_title || format('force-deploy requested by {0}', github.actor) }}
-          TRIGGERED_BY: ${{ github.event.workflow_run.actor.login || github.actor }}
-          REASON:       ${{ inputs.reason }}
-          EVENT:        ${{ github.event_name }}
-          RUN_URL:      ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          APPROVERS:    ${{ vars.CD_APPROVERS }}
-          TIMEOUT_MIN:  ${{ vars.CD_APPROVAL_TIMEOUT_MINUTES || '60' }}
-          BLOCK_SELF:   ${{ vars.CD_BLOCK_SELF_APPROVAL || 'false' }}
-          POLL_SECONDS: '30'
-        run: |
-          set -euo pipefail
-
-          # --- preflight: the gate is an issue, so Issues must be enabled -----
-          if [ "$(gh api "repos/$REPO" --jq '.has_issues')" != "true" ]; then
-            echo "::error::Issues are disabled on this repository, so the approval gate cannot be created. Enable Settings -> General -> Features -> Issues."
-            exit 1
-          fi
-
-          # --- mention the approvers so they actually get notified ------------
-          mentions=""
-          if [ -n "${APPROVERS//[[:space:]]/}" ]; then
-            while read -r u; do
-              [ -n "$u" ] && mentions="$mentions @$u"
-            done < <(printf '%s' "$APPROVERS" | tr ',;' '\n\n' | tr -d '[:space:]')
-          fi
-          [ -n "$mentions" ] || mentions=" anyone with write access to this repository"
-
-          # --- open the approval issue ---------------------------------------
-          if [ "$EVENT" = "workflow_dispatch" ]; then
-            kind="Force-deploy (manual dispatch)"
-            tag="force-deploy"
-          else
-            kind="Automatic, after a green CI run"
-            tag="post-CI"
-          fi
-
-          {
-            echo "### Deployment awaiting approval"
-            echo
-            echo "| | |"
-            echo "| --- | --- |"
-            echo "| Branch | \`$BRANCH\` |"
-            echo "| Commit | \`${SHA:0:8}\` — $TITLE |"
-            echo "| Requested by | @$TRIGGERED_BY |"
-            echo "| Applications | $APPS |"
-            echo "| Kind | $kind |"
-            [ "$EVENT" = "workflow_dispatch" ] && echo "| Reason given | ${REASON:-(none)} |"
-            echo "| Workflow run | [open the run]($RUN_URL) |"
-            echo
-            echo "The deployment is **paused** and will stay paused for up to **$TIMEOUT_MIN minutes**."
-            echo
-            echo "**To approve** — comment: \`approve\`"
-            echo
-            echo "**To reject** — comment: \`deny\`"
-            echo
-            echo "Only these people may decide:$mentions"
-            echo
-            echo "Any other comment is ignored. No approval before the deadline = nothing is deployed."
-          } > /tmp/approval-body.md
-
-          issue_url="$(gh issue create --repo "$REPO" \
-            --title "[$tag] Deploy $BRANCH @ ${SHA:0:8} — approval required ($APPS)" \
-            --body-file /tmp/approval-body.md)"
-          issue_num="${issue_url##*/}"
-          echo "::notice::Approval required — $issue_url"
-          {
-            echo "## Awaiting approval"
-            echo
-            echo "This run is paused. Approve or reject it here: $issue_url"
-            echo
-            echo "| | |"
-            echo "| --- | --- |"
-            echo "| Branch | $BRANCH |"
-            echo "| Commit | ${SHA:0:8} |"
-            echo "| Applications | $APPS |"
-            echo "| Deadline | $TIMEOUT_MIN minutes |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          # --- may this login decide? ----------------------------------------
-          is_approver() {
-            local u="$1" perm
-            if [ -n "${APPROVERS//[[:space:]]/}" ]; then
-              printf '%s' "$APPROVERS" | tr ',;' '\n\n' | tr -d '[:space:]' | grep -Fqix "$u"
-            else
-              perm="$(gh api "repos/$REPO/collaborators/$u/permission" --jq '.permission' 2>/dev/null || echo none)"
-              case "$perm" in admin|maintain|write) return 0 ;; *) return 1 ;; esac
-            fi
-          }
-
-          finish() {   # finish <close-reason> <comment>
-            gh issue comment "$issue_num" --repo "$REPO" --body "$2" >/dev/null || true
-            gh issue close "$issue_num" --repo "$REPO" --reason "$1" >/dev/null || true
-          }
-
-          # --- poll the issue until someone decides ---------------------------
-          deadline=$(( $(date +%s) + TIMEOUT_MIN * 60 ))
-          handled=""
-          while :; do
-            while IFS=$'\t' read -r cid user cbody; do
-              [ -n "${cid:-}" ] || continue
-              # Only the first word counts, so prose never approves by accident.
-              verdict="$(printf '%s' "${cbody:-}" | tr '[:upper:]' '[:lower:]' | tr -d '\r' | awk '{print $1}' | tr -d '/`*.!')"
-              case "$verdict" in
-                approve|approved|lgtm)       decision=approve ;;
-                deny|denied|reject|rejected) decision=deny ;;
-                *) continue ;;
-              esac
-
-              if ! is_approver "$user"; then
-                case "$handled" in *"|$cid|"*) continue ;; esac
-                handled="$handled|$cid|"
-                gh issue comment "$issue_num" --repo "$REPO" \
-                  --body "@$user is not authorised to decide this deployment — ignoring. Still waiting." >/dev/null || true
-                continue
-              fi
-
-              if [ "$BLOCK_SELF" = "true" ] && [ "$user" = "$TRIGGERED_BY" ] && [ "$decision" = "approve" ]; then
-                case "$handled" in *"|$cid|"*) continue ;; esac
-                handled="$handled|$cid|"
-                gh issue comment "$issue_num" --repo "$REPO" \
-                  --body "@$user triggered this build and CD_BLOCK_SELF_APPROVAL is on — someone else must approve. Still waiting." >/dev/null || true
-                continue
-              fi
-
-              if [ "$decision" = "approve" ]; then
-                echo "::notice::Approved by $user"
-                finish completed "Approved by @$user — deploying \`$BRANCH\` @ \`${SHA:0:8}\`. [Run]($RUN_URL)"
-                {
-                  echo "## Approved"
-                  echo
-                  echo "Approved by **@$user** — deploying $APPS from \`$BRANCH\` @ \`${SHA:0:8}\`."
-                } >> "$GITHUB_STEP_SUMMARY"
-                exit 0
-              else
-                echo "::error::Rejected by $user — nothing will be deployed."
-                finish "not planned" "Rejected by @$user — deployment cancelled. Nothing was copied to any server."
-                {
-                  echo "## Rejected"
-                  echo
-                  echo "Rejected by **@$user**. No application was built or deployed."
-                } >> "$GITHUB_STEP_SUMMARY"
-                exit 1
-              fi
-            done < <(gh api "repos/$REPO/issues/$issue_num/comments?per_page=100" --paginate \
-                       --jq '.[] | [.id, .user.login, (.body | gsub("[\r\n]+"; " "))] | @tsv')
-
-            if [ "$(date +%s)" -ge "$deadline" ]; then
-              echo "::error::No approval within $TIMEOUT_MIN minutes — nothing was deployed."
-              finish "not planned" "No approval within $TIMEOUT_MIN minutes — this deployment expired and nothing was deployed. Re-run the CD workflow when you are ready."
-              {
-                echo "## Approval timed out"
-                echo
-                echo "Nobody approved within $TIMEOUT_MIN minutes. No application was built or deployed."
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 1
-            fi
-            sleep "$POLL_SECONDS"
-          done
 
   # =========================================================================
   # PUBLISH LANES — build & package each selected application independently.
-  # `needs: approve` is what makes the gate real: no approval, no build.
+  # Reached only because a human pressed "Run workflow" and passed validation.
   # The environment is attached only to supply the deploy-path variable.
   # =========================================================================
   publish-web:
     name: Publish Dashboard Web
-    needs: [detect-changes, approve]
+    needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.web == 'true'
     environment: web-${{ needs.detect-changes.outputs.environment }}
@@ -521,7 +291,7 @@ jobs:
 
   publish-api:
     name: Publish MJH API
-    needs: [detect-changes, approve]
+    needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.api == 'true'
     environment: api-${{ needs.detect-changes.outputs.environment }}
@@ -550,7 +320,7 @@ jobs:
 
   publish-sso:
     name: Publish Dashboard SSO
-    needs: [detect-changes, approve]
+    needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.sso == 'true'
     environment: sso-${{ needs.detect-changes.outputs.environment }}
@@ -579,7 +349,7 @@ jobs:
 
   publish-svc:
     name: Publish Windows Service
-    needs: [detect-changes, approve]
+    needs: detect-changes
     runs-on: ubuntu-latest
     if: needs.detect-changes.outputs.svc == 'true'
     environment: svc-${{ needs.detect-changes.outputs.environment }}
@@ -610,9 +380,8 @@ jobs:
           retention-days: 7
 
   # =========================================================================
-  # DEPLOY LANES — self-hosted Windows runner. Approval already happened in the
-  # gate job; the deploy path comes from the publish job's output, credentials
-  # from repository secrets.
+  # DEPLOY LANES — self-hosted Windows runner. The deploy path comes from the
+  # publish job's output, credentials from repository secrets.
   # =========================================================================
   deploy-web:
     name: Deploy Web
