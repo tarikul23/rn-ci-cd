@@ -4,7 +4,7 @@ name: Deploy Applications (CD - Manual)
 # just reports what changed and waits for a human to start the deploy.
 run-name: >-
   ${{ github.event_name == 'workflow_dispatch'
-      && format('CD manual → {0} / {1} by {2}', github.ref_name, inputs.application, github.actor)
+      && format('CD manual → {0} / {1} by {2}', inputs.target, inputs.application, github.actor)
       || format('CD check → {0}: {1}', github.event.workflow_run.head_branch, github.event.workflow_run.display_title) }}
 
 # ---------------------------------------------------------------------------
@@ -20,9 +20,14 @@ run-name: >-
 #   2. Deploying requires a deliberate `workflow_dispatch` — the manual run IS
 #      the approval, and GitHub records who pressed it in the run metadata.
 #   3. The `gate` job hardens that press:
-#        - the operator must type the branch name into `confirm`
+#        - the operator picks the target branch from a fixed list
+#        - the operator must type that branch name into `confirm`
 #        - the operator must be listed in the repo variable CD_APPROVERS
-#        - the branch must be dev / staging / hotfix
+#
+# WHICH BRANCH GETS DEPLOYED: the `target` input, NOT the branch you launched
+# the run from. Run it from `main` (the default branch) and pick dev / staging
+# / hotfix — the gate resolves that branch's head commit and every publish job
+# builds that exact SHA, so all four lanes ship one consistent commit.
 #
 # Environments are still used (web-dev, api-staging, ...) but ONLY as the
 # holder of the deploy-path variables — no protection rule required.
@@ -55,9 +60,15 @@ on:
     types: [completed]
     branches: [dev, staging, hotfix]
 
-  # The approval. Run this from the branch you want to deploy.
+  # The approval. Launch it from any branch (main is fine) and pick the target.
   workflow_dispatch:
     inputs:
+      target:
+        description: 'Branch to deploy (this is what gets built & shipped)'
+        required: true
+        default: 'dev'
+        type: choice
+        options: [dev, staging, hotfix]
       application:
         description: 'Application(s) to deploy'
         required: true
@@ -71,7 +82,7 @@ on:
           - dashboard-sso
           - windows-service
       confirm:
-        description: 'Type the branch name to confirm (dev / staging / hotfix)'
+        description: 'Type the target branch name again to confirm'
         required: true
         type: string
       reason:
@@ -81,8 +92,8 @@ on:
         type: string
 
 concurrency:
-  # One in-flight deploy per branch; never interrupt an active deploy.
-  group: cd-${{ github.event.workflow_run.head_branch || github.ref_name }}
+  # One in-flight deploy per target branch; never interrupt an active deploy.
+  group: cd-${{ github.event.inputs.target || github.event.workflow_run.head_branch || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
@@ -178,7 +189,7 @@ jobs:
   # B. GATE — this job IS the approval. Only reached via workflow_dispatch.
   # =========================================================================
   gate:
-    name: Approval gate (${{ github.ref_name }})
+    name: Approval gate (${{ inputs.target }})
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
@@ -187,24 +198,29 @@ jobs:
       sso: ${{ steps.decide.outputs.sso }}
       svc: ${{ steps.decide.outputs.svc }}
       environment: ${{ steps.decide.outputs.environment }}
+      # Exact commit every publish job builds — pinned here so all four lanes
+      # ship the same code even if someone pushes mid-deploy.
+      sha: ${{ steps.decide.outputs.sha }}
     steps:
-      # -- 1. the branch must be a deployable one -----------------------------
-      - name: Validate branch
+      # -- 1. the target must be a deployable branch --------------------------
+      #    The choice input already restricts it; this catches an API-triggered
+      #    dispatch that bypasses the dropdown.
+      - name: Validate target branch
         shell: bash
         env:
-          BRANCH: ${{ github.ref_name }}
+          BRANCH: ${{ inputs.target }}
         run: |
           set -euo pipefail
           case "$BRANCH" in
             dev|staging|hotfix) echo "Target branch: $BRANCH" ;;
-            *) echo "::error::'$BRANCH' is not deployable. Run this from dev, staging or hotfix."; exit 1 ;;
+            *) echo "::error::'$BRANCH' is not deployable. Choose dev, staging or hotfix."; exit 1 ;;
           esac
 
-      # -- 2. the operator must retype the branch name ------------------------
+      # -- 2. the operator must retype the target branch name -----------------
       - name: Validate confirmation
         shell: bash
         env:
-          BRANCH:  ${{ github.ref_name }}
+          BRANCH:  ${{ inputs.target }}
           CONFIRM: ${{ inputs.confirm }}
         run: |
           set -euo pipefail
@@ -236,21 +252,25 @@ jobs:
           fi
 
       # -- 4. work out which applications this run covers ---------------------
-      - name: Checkout source
+      #    Check out the TARGET branch, not the branch this run was launched
+      #    from — that is the code being deployed.
+      - name: Checkout target branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-          ref: ${{ github.ref }}
+          fetch-depth: 0   # full history so we can diff against the parent commit
+          ref: refs/heads/${{ inputs.target }}
 
       - name: Decide applications
         id: decide
         shell: bash
         env:
-          BRANCH: ${{ github.ref_name }}
+          BRANCH: ${{ inputs.target }}
           APP:    ${{ inputs.application }}
         run: |
           set -euo pipefail
           web=false; api=false; sso=false; svc=false
+          SHA="$(git rev-parse HEAD)"
+          echo "Deploying $BRANCH @ $SHA"
 
           case "$APP" in
             dashboard-web)   web=true ;;
@@ -290,16 +310,18 @@ jobs:
             echo "sso=$sso"
             echo "svc=$svc"
             echo "environment=$BRANCH"
+            echo "sha=$SHA"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::branch=$BRANCH web=$web api=$api sso=$sso svc=$svc"
+          echo "::notice::branch=$BRANCH sha=${SHA:0:8} web=$web api=$api sso=$sso svc=$svc"
 
       - name: Record the approval
         shell: bash
         env:
-          BRANCH: ${{ github.ref_name }}
+          BRANCH: ${{ inputs.target }}
           ACTOR:  ${{ github.actor }}
           REASON: ${{ inputs.reason }}
           APP:    ${{ inputs.application }}
+          SHA:    ${{ steps.decide.outputs.sha }}
           WEB:    ${{ steps.decide.outputs.web }}
           API:    ${{ steps.decide.outputs.api }}
           SSO:    ${{ steps.decide.outputs.sso }}
@@ -311,8 +333,8 @@ jobs:
             echo "| | |"
             echo "| --- | --- |"
             echo "| Approved by | @$ACTOR |"
-            echo "| Branch | $BRANCH |"
-            echo "| Commit | ${GITHUB_SHA:0:8} |"
+            echo "| Target branch | $BRANCH |"
+            echo "| Commit | ${SHA:0:8} |"
             echo "| Selection | $APP |"
             echo "| Reason | $REASON |"
             echo
@@ -338,7 +360,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ needs.gate.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -367,7 +389,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ needs.gate.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -396,7 +418,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ needs.gate.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
@@ -428,7 +450,7 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ needs.gate.outputs.sha }}
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
