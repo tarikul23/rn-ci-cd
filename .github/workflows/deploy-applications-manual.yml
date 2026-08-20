@@ -18,10 +18,13 @@ run-name: >-
 #   CI succeeds  ──►  nothing happens here. Check CI is green, then deploy.
 #
 #   You press "Run workflow" (target branch + app checkboxes + confirm)
-#     └─ detect-changes ─┬─ publish-web ─ deploy-web   (Dashboard Web)
-#                        ├─ publish-api ─ deploy-api   (MJH API)
-#                        ├─ publish-sso ─ deploy-sso   (Dashboard SSO)
-#                        └─ publish-svc ─ deploy-svc   (Windows Service)
+#     └─ detect-changes
+#          └─ publish  (restores rn-ci-cd.sln ONCE, then publishes each
+#             │         selected application and uploads its artifact)
+#             ├─ deploy-web   (Dashboard Web)
+#             ├─ deploy-api   (MJH API)
+#             ├─ deploy-sso   (Dashboard SSO)
+#             └─ deploy-svc   (Windows Service)   <- these four run in parallel
 #
 # There is no automatic trigger, so no build is ever packaged and no file is
 # ever copied to a server without someone deliberately starting it. GitHub
@@ -108,6 +111,9 @@ env:
     8.0.x
     10.0.x
   DOTNET_CONFIGURATION: 'Release'
+  # Solution that references every project. Restored once per publish job so
+  # each `dotnet publish` can run with --no-restore.
+  SOLUTION_FILE: 'rn-ci-cd.sln'
   # Project files (source of each application).
   WEB_PROJECT: 'mvc web/DevOps.csproj'
   API_PROJECT: 'web api/web api.csproj'
@@ -280,123 +286,79 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
-  # PUBLISH LANES — build & package each selected application independently.
-  # Reached only because a human pressed "Run workflow" and passed validation.
-  # The environment is attached only to supply the deploy-path variable.
+  # 2. PUBLISH — ONE job for every selected application.
+  #    The solution is restored exactly once per run; each `dotnet publish`
+  #    then runs with --no-restore. Publishes are sequential inside this job,
+  #    which is the trade for not repeating the restore four times.
+  #    No `environment:` here — the deploy jobs read their own deploy path, so
+  #    this job needs no per-app configuration.
   # =========================================================================
-  publish-web:
-    name: Publish Dashboard Web
+  publish:
+    name: Publish (${{ needs.detect-changes.outputs.apps }})
     needs: detect-changes
     runs-on: ubuntu-latest
-    if: needs.detect-changes.outputs.web == 'true'
-    environment: web-${{ needs.detect-changes.outputs.environment }}
-    outputs:
-      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
     steps:
-      - name: Resolve deploy target
-        id: cfg
-        run: echo "deploy_path=${{ vars.WEB_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
       - name: Checkout source
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.detect-changes.outputs.sha }}
+
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # Same cache key as CI, so a CD run reuses the packages CI already pulled.
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Restore solution
+        run: dotnet restore "$SOLUTION_FILE"
+
+      # -- one publish + upload pair per application, each skipped when the
+      #    application was not selected ------------------------------------
       - name: Publish Dashboard Web
-        run: dotnet publish "$WEB_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/web
-      - name: Upload artifact
+        if: needs.detect-changes.outputs.web == 'true'
+        run: dotnet publish "$WEB_PROJECT" --configuration $DOTNET_CONFIGURATION --no-restore --output ./publish/web
+      - name: Upload Dashboard Web artifact
+        if: needs.detect-changes.outputs.web == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.WEB_ARTIFACT }}
           path: ./publish/web
           retention-days: 7
 
-  publish-api:
-    name: Publish MJH API
-    needs: detect-changes
-    runs-on: ubuntu-latest
-    if: needs.detect-changes.outputs.api == 'true'
-    environment: api-${{ needs.detect-changes.outputs.environment }}
-    outputs:
-      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
-    steps:
-      - name: Resolve deploy target
-        id: cfg
-        run: echo "deploy_path=${{ vars.API_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.detect-changes.outputs.sha }}
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Publish MJH API
-        run: dotnet publish "$API_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/api
-      - name: Upload artifact
+        if: needs.detect-changes.outputs.api == 'true'
+        run: dotnet publish "$API_PROJECT" --configuration $DOTNET_CONFIGURATION --no-restore --output ./publish/api
+      - name: Upload MJH API artifact
+        if: needs.detect-changes.outputs.api == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.API_ARTIFACT }}
           path: ./publish/api
           retention-days: 7
 
-  publish-sso:
-    name: Publish Dashboard SSO
-    needs: detect-changes
-    runs-on: ubuntu-latest
-    if: needs.detect-changes.outputs.sso == 'true'
-    environment: sso-${{ needs.detect-changes.outputs.environment }}
-    outputs:
-      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
-    steps:
-      - name: Resolve deploy target
-        id: cfg
-        run: echo "deploy_path=${{ vars.SSO_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.detect-changes.outputs.sha }}
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Publish Dashboard SSO
-        run: dotnet publish "$SSO_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/sso
-      - name: Upload artifact
+        if: needs.detect-changes.outputs.sso == 'true'
+        run: dotnet publish "$SSO_PROJECT" --configuration $DOTNET_CONFIGURATION --no-restore --output ./publish/sso
+      - name: Upload Dashboard SSO artifact
+        if: needs.detect-changes.outputs.sso == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.SSO_ARTIFACT }}
           path: ./publish/sso
           retention-days: 7
 
-  publish-svc:
-    name: Publish Windows Service
-    needs: detect-changes
-    runs-on: ubuntu-latest
-    if: needs.detect-changes.outputs.svc == 'true'
-    environment: svc-${{ needs.detect-changes.outputs.environment }}
-    outputs:
-      deploy_path: ${{ steps.cfg.outputs.deploy_path }}
-      service_name: ${{ steps.cfg.outputs.service_name }}
-    steps:
-      - name: Resolve deploy target
-        id: cfg
-        run: |
-          echo "deploy_path=${{ vars.SVC_DEPLOY_PATH }}" >> "$GITHUB_OUTPUT"
-          echo "service_name=${{ vars.SVC_SERVICE_NAME }}" >> "$GITHUB_OUTPUT"
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.detect-changes.outputs.sha }}
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: ${{ env.DOTNET_VERSION }}
       - name: Publish Windows Service
-        run: dotnet publish "$SVC_PROJECT" --configuration $DOTNET_CONFIGURATION --output ./publish/svc
-      - name: Upload artifact
+        if: needs.detect-changes.outputs.svc == 'true'
+        run: dotnet publish "$SVC_PROJECT" --configuration $DOTNET_CONFIGURATION --no-restore --output ./publish/svc
+      - name: Upload Windows Service artifact
+        if: needs.detect-changes.outputs.svc == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.SVC_ARTIFACT }}
@@ -404,17 +366,21 @@ jobs:
           retention-days: 7
 
   # =========================================================================
-  # DEPLOY LANES — self-hosted Windows runner. The deploy path comes from the
-  # publish job's output, credentials from repository secrets.
+  # 3. DEPLOY LANES — self-hosted Windows runner, one per application, running
+  #    in parallel. Each attaches its own environment, so the deploy path comes
+  #    from that environment's variables and credentials from repo secrets.
   # =========================================================================
   deploy-web:
     name: Deploy Web
-    needs: [detect-changes, publish-web]
+    needs: [detect-changes, publish]
+    if: needs.detect-changes.outputs.web == 'true'
     runs-on: [self-hosted, windows]
+    # Supplies WEB_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    environment: web-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
-        run: Write-Host "Deploying Dashboard Web on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-web.outputs.deploy_path }}'"
+        run: Write-Host "Deploying Dashboard Web on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ vars.WEB_DEPLOY_PATH }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -423,7 +389,7 @@ jobs:
       - name: Deploy Dashboard Web
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ needs.publish-web.outputs.deploy_path }}
+          DEST:            ${{ vars.WEB_DEPLOY_PATH }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.WEB_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
@@ -454,12 +420,15 @@ jobs:
 
   deploy-api:
     name: Deploy API
-    needs: [detect-changes, publish-api]
+    needs: [detect-changes, publish]
+    if: needs.detect-changes.outputs.api == 'true'
     runs-on: [self-hosted, windows]
+    # Supplies API_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    environment: api-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
-        run: Write-Host "Deploying MJH API on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-api.outputs.deploy_path }}'"
+        run: Write-Host "Deploying MJH API on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ vars.API_DEPLOY_PATH }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -468,7 +437,7 @@ jobs:
       - name: Deploy MJH API
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ needs.publish-api.outputs.deploy_path }}
+          DEST:            ${{ vars.API_DEPLOY_PATH }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.API_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
@@ -499,12 +468,15 @@ jobs:
 
   deploy-sso:
     name: Deploy SSO
-    needs: [detect-changes, publish-sso]
+    needs: [detect-changes, publish]
+    if: needs.detect-changes.outputs.sso == 'true'
     runs-on: [self-hosted, windows]
+    # Supplies SSO_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    environment: sso-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
-        run: Write-Host "Deploying Dashboard SSO on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-sso.outputs.deploy_path }}'"
+        run: Write-Host "Deploying Dashboard SSO on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ vars.SSO_DEPLOY_PATH }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -513,7 +485,7 @@ jobs:
       - name: Deploy Dashboard SSO
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ needs.publish-sso.outputs.deploy_path }}
+          DEST:            ${{ vars.SSO_DEPLOY_PATH }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.SSO_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
@@ -546,12 +518,15 @@ jobs:
   # running), then restart it. Set the service name in vars.SVC_SERVICE_NAME.
   deploy-svc:
     name: Deploy SVC
-    needs: [detect-changes, publish-svc]
+    needs: [detect-changes, publish]
+    if: needs.detect-changes.outputs.svc == 'true'
     runs-on: [self-hosted, windows]
+    # Supplies SVC_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    environment: svc-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
-        run: Write-Host "Deploying Windows Service '${{ needs.publish-svc.outputs.service_name }}' on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ needs.publish-svc.outputs.deploy_path }}'"
+        run: Write-Host "Deploying Windows Service '${{ vars.SVC_SERVICE_NAME }}' on branch '${{ needs.detect-changes.outputs.environment }}' to '${{ vars.SVC_DEPLOY_PATH }}'"
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
@@ -560,8 +535,8 @@ jobs:
       - name: Deploy Windows Service
         shell: powershell -ExecutionPolicy Bypass -NoProfile -Command "& '{0}'"
         env:
-          DEST:            ${{ needs.publish-svc.outputs.deploy_path }}
-          SERVICE_NAME:    ${{ needs.publish-svc.outputs.service_name }}
+          DEST:            ${{ vars.SVC_DEPLOY_PATH }}
+          SERVICE_NAME:    ${{ vars.SVC_SERVICE_NAME }}
           DEPLOY_USER:     ${{ secrets.DEPLOY_USER }}
           DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
           EXCLUDE_FILES:   ${{ vars.SVC_EXCLUDE_FILES || 'appsettings.json,appsettings.*.json' }}
