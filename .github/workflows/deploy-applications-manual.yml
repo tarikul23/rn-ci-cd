@@ -179,7 +179,9 @@ jobs:
       - name: Checkout target branch
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history so we can diff against the parent commit
+          # Only HEAD and its parent are needed for the first-parent diff below,
+          # so fetch two commits instead of the entire history.
+          fetch-depth: 2
           # The TARGET branch, not the branch this run was launched from.
           ref: refs/heads/${{ inputs.target }}
 

@@ -65,16 +65,67 @@ jobs:
       REVIEWERS: ${{ vars.REVIEWERS }}
       SET_REVIEWERS: ${{ inputs.set_reviewers }}
     steps:
-      - name: Verify admin token is present
+      # A non-empty secret proves nothing — the token still has to authenticate
+      # AND hold admin on this repo. Check both here so a bad token fails in the
+      # first seconds with a precise message, not mid-way through provisioning.
+      - name: Verify admin token
         run: |
-          if [ -z "$GH_TOKEN" ]; then
+          set -uo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
             echo "::error::Repo secret GH_ADMIN_TOKEN is not set. Create a PAT with admin rights first."
             exit 1
           fi
 
+          # Pasting a token with a trailing newline/space is a common cause of 401.
+          if [ "$GH_TOKEN" != "$(printf '%s' "$GH_TOKEN" | tr -d '[:space:]')" ]; then
+            echo "::warning::GH_ADMIN_TOKEN contains whitespace. If authentication fails, re-paste the secret with no leading/trailing spaces or newline."
+          fi
+
+          # --- does the token authenticate at all? ---------------------------
+          if ! out="$(gh api -i user 2>&1)"; then
+            echo "$out"
+            if printf '%s' "$out" | grep -qi 'bad credentials'; then
+              echo "::error::GH_ADMIN_TOKEN is invalid, expired or revoked (HTTP 401). Generate a new PAT and update the secret: Settings -> Secrets and variables -> Actions -> GH_ADMIN_TOKEN."
+            else
+              echo "::error::Could not authenticate with GH_ADMIN_TOKEN. See the response above."
+            fi
+            exit 1
+          fi
+
+          login="$(gh api user --jq '.login' 2>/dev/null || echo '?')"
+          scopes="$(printf '%s' "$out" | grep -i '^x-oauth-scopes:' | cut -d: -f2- | tr -d ' \r')"
+          echo "Authenticated as: $login"
+          echo "Token scopes:     ${scopes:-(none reported - fine-grained token)}"
+
+          # --- does it have admin on THIS repo? ------------------------------
+          if ! admin="$(gh api "repos/$REPO" --jq '.permissions.admin' 2>/dev/null)"; then
+            echo "::error::Token authenticated as '$login' but cannot see $REPO. A classic PAT needs the 'repo' scope; a fine-grained PAT must grant this repository access."
+            exit 1
+          fi
+          if [ "$admin" != "true" ]; then
+            echo "::error::Token authenticated as '$login' but has no admin on $REPO. Creating environments, variables and secrets requires admin. Classic PAT: 'repo' + 'admin:org' if org-owned. Fine-grained PAT: Administration=RW, Environments=RW, Secrets=RW, Variables=RW."
+            exit 1
+          fi
+          echo "Admin on $REPO:   yes"
+
       - name: Provision environments, variables, secrets (and reviewers)
         run: |
           set -euo pipefail
+
+          # Turns a gh error into something actionable.
+          explain_failure() {
+            local msg="$1" env="$2"
+            if printf '%s' "$msg" | grep -qi 'bad credentials'; then
+              echo "::error::GH_ADMIN_TOKEN was rejected (HTTP 401) while creating '$env'. The token is invalid, expired or revoked — generate a new PAT and update the secret."
+            elif printf '%s' "$msg" | grep -qiE 'not accessible|forbidden|403'; then
+              echo "::error::GH_ADMIN_TOKEN authenticated but is not allowed to create environment '$env' (HTTP 403). It needs admin: classic PAT 'repo' scope, or fine-grained with Administration=RW and Environments=RW."
+            elif printf '%s' "$msg" | grep -qiE 'protection rules|not available|upgrade'; then
+              echo "::error::Environment '$env' was created but a protection rule was refused. Required reviewers need GitHub Pro/Team/Enterprise on a private repo — re-run with set_reviewers = false."
+            else
+              echo "::error::Failed to provision environment '$env'. See the response above."
+            fi
+          }
 
           # Optionally resolve reviewer usernames -> user IDs for protection rules.
           reviewerJson=""
@@ -97,12 +148,22 @@ jobs:
             echo "== $envName =="
 
             # Create/update the environment (idempotent). Include reviewers if set.
+            # Explain the failure rather than letting `set -e` kill the run with
+            # a bare gh error.
             if [ -n "$reviewerJson" ]; then
-              printf '{"reviewers":[%s]}' "$reviewerJson" \
-                | gh api --method PUT "repos/$REPO/environments/$envName" --input - >/dev/null
+              if ! err="$(printf '{"reviewers":[%s]}' "$reviewerJson" \
+                  | gh api --method PUT "repos/$REPO/environments/$envName" --input - 2>&1 >/dev/null)"; then
+                echo "$err"
+                explain_failure "$err" "$envName"
+                exit 1
+              fi
               echo "  environment ready (with reviewers)"
             else
-              gh api --method PUT "repos/$REPO/environments/$envName" >/dev/null
+              if ! err="$(gh api --method PUT "repos/$REPO/environments/$envName" 2>&1 >/dev/null)"; then
+                echo "$err"
+                explain_failure "$err" "$envName"
+                exit 1
+              fi
               echo "  environment ready"
             fi
 
