@@ -19,12 +19,13 @@ run-name: >-
 #
 #   You press "Run workflow" (target branch + app checkboxes + confirm)
 #     └─ detect-changes
-#          └─ publish  (restores rn-ci-cd.sln ONCE, then publishes each
-#             │         selected application and uploads its artifact)
-#             ├─ deploy-web   (Dashboard Web)
-#             ├─ deploy-api   (MJH API)
-#             ├─ deploy-sso   (Dashboard SSO)
-#             └─ deploy-svc   (Windows Service)   <- these four run in parallel
+#          └─ restore  (restores rn-ci-cd.sln ONCE, hands obj/ to publish)
+#             └─ publish  (publishes each selected application with
+#                │          --no-restore and uploads its artifact)
+#                ├─ deploy-web   (Dashboard Web)
+#                ├─ deploy-api   (MJH API)
+#                ├─ deploy-sso   (Dashboard SSO)
+#                └─ deploy-svc   (Windows Service)  <- these four in parallel
 #
 # There is no automatic trigger, so no build is ever packaged and no file is
 # ever copied to a server without someone deliberately starting it. GitHub
@@ -146,6 +147,7 @@ jobs:
       svc: ${{ steps.decide.outputs.svc }}
       any: ${{ steps.decide.outputs.any }}
       apps: ${{ steps.decide.outputs.apps }}
+      codes: ${{ steps.decide.outputs.codes }}
       environment: ${{ steps.decide.outputs.environment }}
       # Exact commit every publish job builds — pinned here so all four lanes
       # ship the same code even if someone pushes mid-deploy.
@@ -248,6 +250,17 @@ jobs:
           apps="$(echo "$apps" | sed 's/^ *//; s/,$//')"
           [ -n "$apps" ] || apps="(none)"
 
+          # Short form for the publish job's name — the graph truncates a job
+          # label at roughly 30 characters, so the long list never fits.
+          codes=""
+          [ "$web" = "true" ] && codes="$codes web" || true
+          [ "$api" = "true" ] && codes="$codes api" || true
+          [ "$sso" = "true" ] && codes="$codes sso" || true
+          [ "$svc" = "true" ] && codes="$codes svc" || true
+          codes="${codes# }"
+          [ -n "$codes" ] || codes="none"
+
+
           {
             echo "web=$web"
             echo "api=$api"
@@ -255,6 +268,7 @@ jobs:
             echo "svc=$svc"
             echo "any=$any"
             echo "apps=$apps"
+            echo "codes=$codes"
             echo "environment=$BRANCH"
             echo "sha=$SHA"
           } >> "$GITHUB_OUTPUT"
@@ -286,15 +300,21 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # =========================================================================
-  # 2. PUBLISH — ONE job for every selected application.
-  #    The solution is restored exactly once per run; each `dotnet publish`
-  #    then runs with --no-restore. Publishes are sequential inside this job,
-  #    which is the trade for not repeating the restore four times.
-  #    No `environment:` here — the deploy jobs read their own deploy path, so
-  #    this job needs no per-app configuration.
+  # 2. RESTORE — restores rn-ci-cd.sln once, in its own job.
+  #    `dotnet restore` produces two things: the packages (in ~/.nuget/packages,
+  #    which actions/cache carries between jobs) and per-project build state in
+  #    each obj/ directory (project.assets.json and the generated .props /
+  #    .targets), which a cache CANNOT carry. So obj/ is tarred and handed to
+  #    the publish job as an artifact — that is what lets publish use
+  #    --no-restore.
+  #
+  #    NOTE: the generated files embed absolute paths (/home/runner/...). Both
+  #    jobs run on ubuntu-latest with the same workspace path, so they match.
+  #    If either job ever moves to a different runner image or a self-hosted
+  #    box, drop the artifact and restore inside publish instead.
   # =========================================================================
-  publish:
-    name: Publish (${{ needs.detect-changes.outputs.apps }})
+  restore:
+    name: Restore solution
     needs: detect-changes
     runs-on: ubuntu-latest
     steps:
@@ -318,6 +338,72 @@ jobs:
 
       - name: Restore solution
         run: dotnet restore "$SOLUTION_FILE"
+
+      # Tar rather than upload obj/** directly: upload-artifact roots the
+      # archive at the common ancestor of the matched files, which would move
+      # the paths if only one project produced output.
+      - name: Package restore state
+        run: |
+          set -euo pipefail
+          find . -type d -name obj -not -path './.git/*' -prune -print > obj-dirs.txt
+          if [ ! -s obj-dirs.txt ]; then
+            echo "::error::dotnet restore produced no obj/ directories — nothing to hand to publish."
+            exit 1
+          fi
+          echo "Restore state directories:"; cat obj-dirs.txt
+          tar -czf restore-state.tar.gz -T obj-dirs.txt
+          ls -lh restore-state.tar.gz
+
+      - name: Upload restore state
+        uses: actions/upload-artifact@v4
+        with:
+          name: restore-state
+          path: restore-state.tar.gz
+          retention-days: 1
+
+  # =========================================================================
+  # 3. PUBLISH — ONE job for every selected application, reusing the restore
+  #    job's output so no restore happens here. Publishes are sequential
+  #    inside this job.
+  #    No `environment:` here — the deploy jobs read their own deploy path, so
+  #    this job needs no per-app configuration.
+  # =========================================================================
+  publish:
+    name: Publish · ${{ needs.detect-changes.outputs.codes }}
+    needs: [detect-changes, restore]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.detect-changes.outputs.sha }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      # A cache HIT is required, not optional: the restore state handed over
+      # below points at package paths under ~/.nuget/packages.
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj') }}
+          restore-keys: nuget-${{ runner.os }}-
+
+      - name: Download restore state
+        uses: actions/download-artifact@v4
+        with:
+          name: restore-state
+
+      - name: Unpack restore state
+        run: |
+          set -euo pipefail
+          tar -xzf restore-state.tar.gz
+          rm -f restore-state.tar.gz
+          echo "Restored obj/ state for:"
+          find . -name project.assets.json -not -path './.git/*' | sed 's|/obj/project.assets.json||'
 
       # -- one publish + upload pair per application, each skipped when the
       #    application was not selected ------------------------------------
@@ -364,9 +450,8 @@ jobs:
           name: ${{ env.SVC_ARTIFACT }}
           path: ./publish/svc
           retention-days: 7
-
   # =========================================================================
-  # 3. DEPLOY LANES — self-hosted Windows runner, one per application, running
+  # 4. DEPLOY LANES — self-hosted Windows runner, one per application, running
   #    in parallel. Each attaches its own environment, so the deploy path comes
   #    from that environment's variables and credentials from repo secrets.
   # =========================================================================
@@ -375,7 +460,7 @@ jobs:
     needs: [detect-changes, publish]
     if: needs.detect-changes.outputs.web == 'true'
     runs-on: [self-hosted, windows]
-    # Supplies WEB_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    # Supplies WEB_DEPLOY_PATH for this app+branch.
     environment: web-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
@@ -423,7 +508,7 @@ jobs:
     needs: [detect-changes, publish]
     if: needs.detect-changes.outputs.api == 'true'
     runs-on: [self-hosted, windows]
-    # Supplies API_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    # Supplies API_DEPLOY_PATH for this app+branch.
     environment: api-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
@@ -471,7 +556,7 @@ jobs:
     needs: [detect-changes, publish]
     if: needs.detect-changes.outputs.sso == 'true'
     runs-on: [self-hosted, windows]
-    # Supplies SSO_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    # Supplies SSO_DEPLOY_PATH for this app+branch.
     environment: sso-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
@@ -521,7 +606,7 @@ jobs:
     needs: [detect-changes, publish]
     if: needs.detect-changes.outputs.svc == 'true'
     runs-on: [self-hosted, windows]
-    # Supplies SVC_DEPLOY_PATH (and SVC_SERVICE_NAME) for this app+branch.
+    # Supplies SVC_DEPLOY_PATH and SVC_SERVICE_NAME for this app+branch.
     environment: svc-${{ needs.detect-changes.outputs.environment }}
     steps:
       - name: Target
