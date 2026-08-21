@@ -48,6 +48,13 @@ on:
         default: 'dashboard-web'
         type: choice
         options: [dashboard-web, mjh-api, dashboard-sso, windows-service]
+      # Only reachable on a manual dispatch - an automatic post-CI run has no
+      # form to tick, so the check below is skipped for workflow_run.
+      confirm:
+        description: 'Confirm: yes, deploy this branch now'
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   # One in-flight deploy per branch; never interrupt an active deploy.
@@ -107,8 +114,24 @@ jobs:
           ACTOR:     ${{ github.event.workflow_run.actor.login || github.actor }}
           APPROVERS: ${{ vars.CD_APPROVERS }}
           EVENT:     ${{ github.event_name }}
+          CONFIRM:   ${{ inputs.confirm }}
         run: |
           set -euo pipefail
+
+          # A manual force-deploy must be confirmed. GitHub renders the
+          # checkbox but never requires it to be ticked, so enforce it here.
+          # An automatic post-CI run has no form, so CONFIRM is empty and
+          # this check does not apply.
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "${CONFIRM:-}" != "true" ]; then
+            echo "::error title=Confirmation required::The confirm checkbox was not ticked. Nothing was deployed."
+            {
+              echo "> [!CAUTION]"
+              echo "> **Deployment cancelled - not confirmed.**"
+              echo "> The *Confirm* checkbox was left unticked, so nothing was published and no file was copied to a server."
+              echo "> Re-run with the checkbox ticked."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
           if [ -z "${APPROVERS//[[:space:]]/}" ]; then
             echo "::warning::Repo variable CD_APPROVERS is empty - any push that passes CI will deploy. Set it to restrict who can trigger a deployment."
