@@ -97,6 +97,57 @@ jobs:
       svc: ${{ steps.decide.outputs.svc }}
       environment: ${{ steps.decide.outputs.environment }}
     steps:
+      # -- who is allowed to cause a deployment? -----------------------------
+      #    Auto runs are attributed to whoever pushed the commit CI validated;
+      #    manual runs to whoever pressed Run workflow. An empty CD_APPROVERS
+      #    only warns, so the workflow still runs before the variable is set.
+      - name: Validate approver
+        shell: bash
+        env:
+          ACTOR:     ${{ github.event.workflow_run.actor.login || github.actor }}
+          APPROVERS: ${{ vars.CD_APPROVERS }}
+          EVENT:     ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APPROVERS//[[:space:]]/}" ]; then
+            echo "::warning::Repo variable CD_APPROVERS is empty - any push that passes CI will deploy. Set it to restrict who can trigger a deployment."
+            {
+              echo "> [!WARNING]"
+              echo "> **No approver list configured.** Any push that passes CI deploys straight to the servers."
+              echo "> Set the repository variable \`CD_APPROVERS\` to restrict who can trigger a deployment."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # "@a @b" for the summary, so the approvers are named and notified.
+          mentions=""
+          while read -r u; do
+            [ -n "$u" ] && mentions="$mentions @$u"
+          done < <(printf '%s\n' "$APPROVERS" | tr ',;' '\n\n' | tr -d ' \t\r')
+          mentions="${mentions# }"
+
+          if printf '%s' "$APPROVERS" | tr ',;' '\n\n' | tr -d ' \t\r' | grep -Fqix "$ACTOR"; then
+            echo "Approver '$ACTOR' accepted ($EVENT)."
+            {
+              echo "> [!NOTE]"
+              echo "> Deployment authorised for **@$ACTOR** (listed in \`CD_APPROVERS\`)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            # Annotation: shows in the run's Annotations box and in the job log.
+            echo "::error title=Approval required::@$ACTOR is not an approver. Nothing was deployed. Approvers: $mentions"
+            # Summary: a coloured callout on the run page - the closest thing to
+            # GitHub's own "Review deployments" prompt that a workflow can draw.
+            {
+              echo "> [!CAUTION]"
+              echo "> **Deployment blocked - approval required.**"
+              echo "> **@$ACTOR** is not listed in \`CD_APPROVERS\`, so nothing was published and no file was copied to a server."
+              echo "> Approvers who can ship this commit: $mentions"
+              echo "> They can deploy it from **Actions -> Deploy Applications (CD - Manually) -> Run workflow**."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
       - name: Checkout source
         uses: actions/checkout@v4
         with:
