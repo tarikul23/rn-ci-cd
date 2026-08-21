@@ -155,6 +155,19 @@ jobs:
             {
               echo "> [!NOTE]"
               echo "> Deployment authorised for **@$ACTOR** (listed in \`CD_APPROVERS\`)."
+              echo
+              echo "**Pre-deployment checks**"
+              echo
+              echo "- [x] Approver verified: **@$ACTOR**"
+              if [ "$EVENT" = "workflow_dispatch" ]; then
+                echo "- [x] Confirmation checkbox ticked"
+                echo "- [x] Trigger: manual dispatch"
+              else
+                echo "- [x] CI succeeded on this commit"
+                echo "- [x] Trigger: automatic (no confirmation form on a post-CI run)"
+              fi
+              echo
+              echo "<sub>Checkboxes are a record of what was verified - GitHub renders them read-only outside issues and pull requests.</sub>"
             } >> "$GITHUB_STEP_SUMMARY"
           else
             # Annotation: shows in the run's Annotations box and in the job log.
