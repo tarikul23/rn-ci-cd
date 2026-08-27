@@ -55,15 +55,17 @@ pipeline {
             defaultValue: false,
             description: 'Required when APPLICATION is not auto-detect: confirms a forced deployment of this branch.'
         )
+        // Empty = any available node, which is what a single-machine Jenkins
+        // wants. Set a label once there are agents worth choosing between.
         string(
             name: 'BUILD_AGENT_LABEL',
-            defaultValue: 'dotnet',
-            description: 'Agent label for restore/build/test/publish. Needs the .NET 8 and .NET 10 SDKs.'
+            defaultValue: '',
+            description: 'Agent label for restore/build/test/publish; blank = any node. The node needs the .NET 8 and .NET 10 SDKs.'
         )
         string(
             name: 'DEPLOY_AGENT_LABEL',
-            defaultValue: 'windows',
-            description: 'Agent label for the deploy steps. Must be a Windows agent with access to the deploy paths.'
+            defaultValue: '',
+            description: 'Agent label for the deploy steps; blank = any node. Must be Windows, with access to the deploy paths.'
         )
     }
 

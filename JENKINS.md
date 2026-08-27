@@ -130,8 +130,17 @@ because the Java properties format would eat the backslashes in `D:\DevOps\...`.
 
 | Label (build parameter) | Default | Requirements |
 | --- | --- | --- |
-| `BUILD_AGENT_LABEL` | `dotnet` | .NET SDK **8.0** and **10.0** (Web + API target net10.0; SSO + WindowsService target net8.0). Linux or Windows. |
-| `DEPLOY_AGENT_LABEL` | `windows` | Windows agent with write access to the deploy paths, and permission to stop/start the service named in `SVC_SERVICE_NAME`. |
+| `BUILD_AGENT_LABEL` | *(blank — any node)* | .NET SDK **8.0** and **10.0** (Web + API target net10.0; SSO + WindowsService target net8.0). Linux or Windows. |
+| `DEPLOY_AGENT_LABEL` | *(blank — any node)* | Windows node with write access to the deploy paths, and permission to stop/start the service named in `SVC_SERVICE_NAME`. |
+
+Both default to blank, meaning **any available node** — the right behaviour for a
+single-machine Jenkins, where the controller is the only executor. Nothing needs
+labelling to get started.
+
+Once there is more than one node, set the parameters to real labels (e.g.
+`dotnet` and `windows`) and label the nodes to match, so builds land on machines
+that actually have the SDK. A run whose label matches no node does not fail — it
+waits in the queue forever, logging `'<node>' doesn't have label '<label>'`.
 
 Publishing is framework-dependent, so a Linux build agent can produce artifacts
 that a Windows agent deploys. If you only have one Windows agent, give it both
