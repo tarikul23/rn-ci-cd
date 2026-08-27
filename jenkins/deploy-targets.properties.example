@@ -1,0 +1,42 @@
+# Optional fallback configuration for the Jenkins pipeline.
+#
+# The pipeline looks each setting up in this order:
+#   1. Jenkins environment  <KEY>_<BRANCH>   e.g. WEB_DEPLOY_PATH_DEV
+#   2. Jenkins environment  <KEY>            e.g. WEB_DEPLOY_PATH
+#   3. this file            <KEY>_<BRANCH>, then <KEY>
+#   4. the built-in default (exclude lists only)
+#
+# Prefer Jenkins global/folder properties for real environments - changing a
+# deploy path then does not need a commit. Copy this file to
+# jenkins/deploy-targets.properties only if you want the targets versioned
+# with the code.
+#
+# Values are read literally: no backslash escaping, no quotes.
+
+# --- deploy paths (one per application and branch) -------------------------
+WEB_DEPLOY_PATH_DEV=D:\DevOps\dev\web
+API_DEPLOY_PATH_DEV=D:\DevOps\dev\api
+SSO_DEPLOY_PATH_DEV=D:\DevOps\dev\sso
+SVC_DEPLOY_PATH_DEV=D:\DevOps\dev\svc
+
+WEB_DEPLOY_PATH_STAGING=D:\DevOps\staging\web
+API_DEPLOY_PATH_STAGING=D:\DevOps\staging\api
+SSO_DEPLOY_PATH_STAGING=D:\DevOps\staging\sso
+SVC_DEPLOY_PATH_STAGING=D:\DevOps\staging\svc
+
+WEB_DEPLOY_PATH_HOTFIX=D:\DevOps\hotfix\web
+API_DEPLOY_PATH_HOTFIX=D:\DevOps\hotfix\api
+SSO_DEPLOY_PATH_HOTFIX=D:\DevOps\hotfix\sso
+SVC_DEPLOY_PATH_HOTFIX=D:\DevOps\hotfix\svc
+
+# --- Windows Service name (required for the svc lane to swap locked binaries)
+SVC_SERVICE_NAME_DEV=DevOpsWorkerDev
+SVC_SERVICE_NAME_STAGING=DevOpsWorkerStaging
+SVC_SERVICE_NAME_HOTFIX=DevOpsWorkerHotfix
+
+# --- files and folders preserved on the target -----------------------------
+# Separated by commas, semicolons or new lines; robocopy wildcards allowed.
+# Defaults: *_EXCLUDE_FILES = appsettings.json,appsettings.*.json
+#           WEB/API/SSO_EXCLUDE_DIRS = uploads   SVC_EXCLUDE_DIRS = (empty)
+#WEB_EXCLUDE_FILES=appsettings.json,appsettings.*.json,web.config
+#WEB_EXCLUDE_DIRS=uploads,logs

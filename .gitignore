@@ -482,3 +482,6 @@ $RECYCLE.BIN/
 
 # Vim temporary swap files
 *.swp
+
+# Jenkins: real deploy targets (copy of jenkins/deploy-targets.properties.example)
+jenkins/deploy-targets.properties

@@ -9,6 +9,9 @@ CI/CD for this ASP.NET Core solution is driven by GitHub Actions workflows in
 | Deploy Applications (CD) | `deploy-applications.yml` | Publishes and deploys the changed application(s) after CI succeeds. |
 | Provision Deploy Environments | `setup-environments.yml` | One-time: creates the 12 environments and their variables/secrets. |
 
+The same pipeline is also available for Jenkins — see [`JENKINS.md`](JENKINS.md)
+for the `Jenkinsfile` at the repository root.
+
 ## Applications
 
 The solution contains four deployable applications plus a shared library:
