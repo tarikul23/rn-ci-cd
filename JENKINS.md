@@ -58,11 +58,64 @@ each branch gets its own job and its own `disableConcurrentBuilds` lock:
 1. **Branch Sources → Git/GitHub**, point it at this repository and add the
    read credentials.
 2. **Build Configuration → by Jenkinsfile**, script path `Jenkinsfile`.
-3. **Scan Multibranch Pipeline Triggers** — periodically, or add a GitHub
-   webhook for push builds.
+3. **Scan Multibranch Pipeline Triggers** → *Periodically if not otherwise run*
+   → **1 minute**, so new branches and new commits are picked up.
 
 A plain Pipeline job also works; it reads the branch from git instead of
 `BRANCH_NAME`.
+
+> The job must use **Pipeline script from SCM** (or a Multibranch source). An
+> inline *Pipeline script* job has no repository attached, so Jenkins never
+> checks the code out: the build starts in an empty workspace and every `dotnet`
+> and `git` step fails.
+
+## Triggers — building on every push
+
+The `Jenkinsfile` declares both triggers, so no UI configuration is needed:
+
+```groovy
+triggers {
+    githubPush()                // instant, needs an inbound webhook
+    pollSCM('H/2 * * * *')      // asks GitHub every ~2 minutes
+}
+```
+
+A declarative `triggers` block is registered **while the job runs**, so build the
+job once by hand after adding it. From then on it starts itself.
+
+### Polling (works anywhere)
+
+`pollSCM` needs no inbound access, so it is the one that works while Jenkins
+lives on `localhost`. Worst-case delay is the poll interval. On a Multibranch
+job, also set the 1-minute scan above so brand-new branches appear.
+
+### Webhook (instant, needs a reachable Jenkins)
+
+`githubPush()` only fires if github.com can reach your controller — which it
+cannot at `http://localhost:8080`. Give Jenkins a public URL first (a real
+hostname, or a tunnel such as ngrok/smee), then:
+
+1. Jenkins → **Manage Jenkins → System → GitHub** → add a GitHub Server with a
+   PAT credential, and tick *Manage hooks* to let Jenkins register the webhook
+   itself.
+2. Or add it by hand: GitHub repo → **Settings → Webhooks → Add webhook**
+   - Payload URL `https://<public-host>/github-webhook/` (the trailing slash
+     matters)
+   - Content type `application/json`
+   - Events: *Just the push event*
+3. Push a commit and check **Settings → Webhooks → Recent Deliveries** for a
+   `200`.
+
+Keeping both triggers is deliberate: the webhook gives instant builds when it is
+available, polling covers the times it is not, and Jenkins will not build the
+same commit twice.
+
+### Which branches build vs. deploy
+
+Every branch with a `Jenkinsfile` **builds**. Only `dev`, `staging` and `hotfix`
+**deploy** — `DEPLOY_BRANCHES` in the `Jenkinsfile`. A push to `main` therefore
+runs restore/build/test and stops with `Branch 'main' is not a deploy branch`.
+Add `main` to `DEPLOY_BRANCHES` if it should deploy too.
 
 ### Required plugins
 

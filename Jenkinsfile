@@ -29,6 +29,21 @@ pipeline {
         timeout(time: 4, unit: 'HOURS')
     }
 
+    // Every push builds this branch.
+    //   githubPush  fires the moment GitHub delivers a webhook. Needs Jenkins to
+    //               be reachable from github.com - see JENKINS.md.
+    //   pollSCM     asks GitHub for new commits every ~2 minutes. This is what
+    //               actually works while Jenkins is only on localhost.
+    // Both are declared: whichever can reach the repo first starts the build,
+    // and Jenkins will not run the same commit twice.
+    //
+    // NOTE: a declarative `triggers` block is registered when the job runs, so
+    // build the job once by hand after adding it - only then does it self-start.
+    triggers {
+        githubPush()
+        pollSCM('H/2 * * * *')
+    }
+
     parameters {
         choice(
             name: 'APPLICATION',
@@ -280,7 +295,7 @@ def detectChanges() {
         if (!base) {
             echo 'No commit to diff against (shallow clone, or first commit on the branch) - nothing will be deployed. Re-run with APPLICATION set to force a deploy.'
         } else {
-            def changed = runCmdOutput("git diff --name-only ${base} HEAD").readLines()*.trim().findAll { it }
+            def changed = splitLines(runCmdOutput("git diff --name-only ${base} HEAD"))
             echo "Changed files since ${base}:\n  " + changed.join('\n  ')
 
             def sharedChanged = changed.any { it.startsWith(sharedDir() + '/') }
@@ -300,6 +315,13 @@ def detectChanges() {
     env.DEPLOY_ANY = flags.any { k, v -> v }.toString()
 
     echo "Deploy plan: ${deploySummary()}"
+}
+
+// Trimmed, non-empty lines. Kept @NonCPS: the CPS transformer does not support
+// the spread operator, and this keeps the list handling out of the CPS engine.
+@NonCPS
+def splitLines(String text) {
+    return text.readLines().collect { it.trim() }.findAll { it }
 }
 
 // Previous successful build's commit if Jenkins knows it, else the first parent.
