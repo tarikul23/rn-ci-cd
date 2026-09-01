@@ -7,6 +7,12 @@
 //   CI   restore -> build -> test the whole solution
 //   CD   deploy only the applications whose files changed, each in its own lane
 //
+//        detect -- [approve all] --+-- publish web -- deploy web   (mvc web/)
+//
+//   APPROVAL_MODE=all-in-one (default) asks once for the whole plan, with a
+//   tick box per application. APPROVAL_MODE=per-application asks inside each
+//   lane instead:
+//
 //        detect --+-- [approve] publish web -- deploy web   (mvc web/)
 //                 +-- [approve] publish api -- deploy api   (web api/)
 //                 +-- [approve] publish sso -- deploy sso   (SSO/)
@@ -56,6 +62,11 @@ pipeline {
             name: 'CONFIRM_DEPLOY',
             defaultValue: false,
             description: 'Required when APPLICATION is not auto-detect: confirms a forced deployment of this branch.'
+        )
+        choice(
+            name: 'APPROVAL_MODE',
+            choices: ['all-in-one', 'per-application'],
+            description: 'all-in-one asks once, before anything is published, with a tick box per application - untick one to leave it undeployed. per-application asks separately inside each lane, right before that application is published, so different people can sign off on different applications.'
         )
         // Empty = any available node, which is what a single-machine Jenkins
         // wants. Set a label once there are agents worth choosing between.
@@ -122,6 +133,20 @@ pipeline {
         // CD - four independent lanes. A rejection or failure in one lane never
         // blocks the others (failFast is off), matching the Actions layout.
         // -------------------------------------------------------------------
+        // -------------------------------------------------------------------
+        // One gate for the whole plan. Held on `agent none`, and placed before
+        // the parallel block so a rejection costs nothing: nothing has been
+        // published yet.
+        // -------------------------------------------------------------------
+        stage('CD - Approve') {
+            agent none
+            when {
+                beforeAgent true
+                expression { env.DEPLOY_ANY == 'true' && approvalMode() == 'all-in-one' }
+            }
+            steps { script { approveAll() } }
+        }
+
         stage('CD - Publish & Deploy') {
             when { expression { env.DEPLOY_ANY == 'true' } }
             parallel {
@@ -131,6 +156,9 @@ pipeline {
                     stages {
                         stage('Approve Web') {
                             agent none
+                            when {
+                                expression { env.DEPLOY_WEB == 'true' && approvalMode() == 'per-application' }
+                            }
                             steps { script { approveApp('web') } }
                         }
                         stage('Publish Web') {
@@ -157,6 +185,9 @@ pipeline {
                     stages {
                         stage('Approve API') {
                             agent none
+                            when {
+                                expression { env.DEPLOY_API == 'true' && approvalMode() == 'per-application' }
+                            }
                             steps { script { approveApp('api') } }
                         }
                         stage('Publish API') {
@@ -183,6 +214,9 @@ pipeline {
                     stages {
                         stage('Approve SSO') {
                             agent none
+                            when {
+                                expression { env.DEPLOY_SSO == 'true' && approvalMode() == 'per-application' }
+                            }
                             steps { script { approveApp('sso') } }
                         }
                         stage('Publish SSO') {
@@ -209,6 +243,9 @@ pipeline {
                     stages {
                         stage('Approve SVC') {
                             agent none
+                            when {
+                                expression { env.DEPLOY_SVC == 'true' && approvalMode() == 'per-application' }
+                            }
                             steps { script { approveApp('svc') } }
                         }
                         stage('Publish SVC') {
@@ -424,10 +461,156 @@ def deploySummary() {
     return on ? on.join(', ') : 'no application deployed'
 }
 
+// A missing APPROVAL_MODE means the job has not been rebuilt since the
+// parameter was added - a declarative `parameters` block only registers when the
+// job runs. Defaulting to all-in-one keeps a gate in place on that first build
+// rather than letting it through ungated.
+def approvalMode() { return (params.APPROVAL_MODE ?: 'all-in-one') }
+
 // ---------------------------------------------------------------------------
-// Approval gate - runs before the build, so a reviewer signs off on the change
-// rather than on an artifact that is already sitting on disk. Held on `agent
-// none` so a waiting approval does not occupy an executor.
+// Single approval covering every application in the plan. One dialog, one tick
+// box per application (all ticked by default), so "approve everything" is one
+// click and "everything except the service" is two.
+// ---------------------------------------------------------------------------
+def approveAll() {
+    def apps    = appCatalog()
+    def planned = []
+    apps.each { k, app -> if (env."DEPLOY_${k.toUpperCase()}" == 'true') { planned << k } }
+    if (!planned) { return }
+
+    if ((env.REQUIRE_APPROVAL ?: 'true').toLowerCase() == 'false') {
+        echo 'REQUIRE_APPROVAL=false - deploying the whole plan without a manual gate.'
+        return
+    }
+
+    def approvers = (env.CD_APPROVERS ?: '').trim()
+    def waitMins  = (env.APPROVAL_TIMEOUT_MINUTES ?: '60') as Integer
+
+    echo approvalReportAll(planned, waitMins, approvers)
+
+    // One tick box per application, then the shared note field.
+    def formParams = []
+    for (k in planned) {
+        def K = k.toUpperCase()
+        def target = env."TARGET_${K}" ?: 'NOT CONFIGURED - this deploy will fail'
+        formParams << booleanParam(
+            name: 'OK_' + K,
+            defaultValue: true,
+            description: "${apps[k].name}  ->  ${target}"
+        )
+    }
+    formParams << string(
+        name: 'NOTE',
+        defaultValue: '',
+        description: 'Ticket or reason (optional). Recorded in the build log next to your name.'
+    )
+
+    def startedAt = System.currentTimeMillis()
+
+    try {
+        def answer = null
+        timeout(time: waitMins, unit: 'MINUTES') {
+            answer = input(
+                message: approvalPromptAll(planned),
+                ok: 'Deploy the ticked applications',
+                submitter: approvers ?: null,
+                submitterParameter: 'APPROVER',
+                parameters: formParams
+            )
+        }
+
+        def who  = answer.APPROVER ?: 'an unidentified user'
+        def note = (answer.NOTE ?: '').trim()
+        def why  = note ? " - ${note}" : ''
+
+        for (k in planned) {
+            def K = k.toUpperCase()
+            // 'OK_' + K, not "OK_${K}": a GString would never match the String
+            // key the input step put in the map.
+            if (answer['OK_' + K]) {
+                echo "APPROVED  ${apps[k].name} -> ${env.TARGET_BRANCH} by ${who}${why}"
+                noteOnBuild("${apps[k].name}: approved by ${who}")
+            } else {
+                env."DEPLOY_${K}" = 'false'
+                echo "SKIPPED   ${apps[k].name} - left unticked by ${who}${why}. Nothing was published; the server was not touched."
+                noteOnBuild("${apps[k].name}: skipped by ${who}")
+            }
+        }
+    }
+    catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+        def kind = interruptionKind(e, System.currentTimeMillis() - startedAt, waitMins)
+        if (kind == 'aborted') { throw e }
+
+        for (k in planned) { env."DEPLOY_${k.toUpperCase()}" = 'false' }
+        if (kind == 'timeout') {
+            echo "TIMED OUT nobody answered within ${waitMins} minute(s). Nothing was deployed."
+            noteOnBuild('deploy plan timed out')
+        } else {
+            echo 'DECLINED  the deploy plan was rejected. Nothing was deployed.'
+            noteOnBuild('deploy plan declined')
+        }
+        catchError(buildResult: 'SUCCESS', stageResult: 'NOT_BUILT') {
+            error('The deploy plan was not approved.')
+        }
+    }
+    finally {
+        // Whatever survived the gate decides whether the parallel block runs.
+        refreshDeployAny()
+    }
+}
+
+def refreshDeployAny() {
+    def any = false
+    appCatalog().each { k, app -> if (env."DEPLOY_${k.toUpperCase()}" == 'true') { any = true } }
+    env.DEPLOY_ANY = any.toString()
+    echo "Deploy plan after approval: ${deploySummary()}"
+}
+
+def approvalPromptAll(List planned) {
+    def apps = appCatalog()
+    def out  = "Deploy ${planned.size()} application(s) to '${env.TARGET_BRANCH}'?"
+    out += "\n- commit ${env.COMMIT_SHORT ?: '?'} by ${env.COMMIT_AUTHOR ?: '?'}: ${env.COMMIT_SUBJECT ?: ''}"
+    out += "\n- every application below is ticked; untick any you do not want deployed"
+    out += "\n- full detail, target paths included, is in the console log"
+    out += "\n- build #${env.BUILD_NUMBER}"
+    return out
+}
+
+def approvalReportAll(List planned, int waitMins, String approvers) {
+    def apps = appCatalog()
+    def rows = []
+    rows << "branch        ${env.TARGET_BRANCH}"
+    rows << "build         #${env.BUILD_NUMBER}"
+    rows << "commit        ${env.COMMIT_SHORT ?: '?'}  ${env.COMMIT_SUBJECT ?: ''}"
+    rows << "author        ${env.COMMIT_AUTHOR ?: '?'}"
+    rows << ''
+
+    for (k in planned) {
+        def K       = k.toUpperCase()
+        def changed = env."CHANGED_${K}" ?: 'forced deployment (APPLICATION parameter)'
+        def target  = env."TARGET_${K}"  ?: 'NOT CONFIGURED - this deploy will fail, see JENKINS.md'
+        def kept    = env."KEPT_${K}"    ?: '-'
+        rows << "${apps[k].name}"
+        rows << "    why       ${changed}"
+        rows << "    publishes ${apps[k].project}"
+        rows << "    target    ${target}"
+        rows << "    kept      ${kept}"
+        if (k == 'svc' && env.SERVICE_SVC) { rows << "    service   ${env.SERVICE_SVC} (stopped for the copy, restarted after)" }
+        rows << ''
+    }
+
+    rows << "approvers     ${approvers ?: 'ANYONE who can see this build - set CD_APPROVERS to restrict'}"
+    rows << "expires       in ${waitMins} minute(s), after which nothing is deployed"
+    rows << "decide at     ${env.BUILD_URL ?: ''}input"
+
+    return renderBanner("APPROVAL REQUIRED: ${planned.size()} application(s) -> ${env.TARGET_BRANCH}", rows)
+}
+
+// ---------------------------------------------------------------------------
+// Per-application gate, used when APPROVAL_MODE is per-application. Runs inside
+// the lane, before that application is published, so a reviewer signs off on the
+// change rather than on an artifact that is already sitting on disk. Held on
+// `agent none` so a waiting approval does not occupy an executor.
 // ---------------------------------------------------------------------------
 def approveApp(String key) {
     def app  = appCatalog()[key]
