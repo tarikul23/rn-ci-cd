@@ -106,7 +106,9 @@ pipeline {
                         echo 'No test projects found in the solution - skipping. Add one to enable tests.'
                     }
 
+                    captureCommitInfo()
                     detectChanges()
+                    captureDeploySettings()
                 }
             }
             post {
@@ -133,10 +135,18 @@ pipeline {
                         }
                         stage('Publish Web') {
                             agent { label params.BUILD_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_WEB == 'true' }
+                            }
                             steps { script { publishApp('web') } }
                         }
                         stage('Deploy Web') {
                             agent { label params.DEPLOY_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_WEB == 'true' }
+                            }
                             steps { script { deployApp('web') } }
                         }
                     }
@@ -151,10 +161,18 @@ pipeline {
                         }
                         stage('Publish API') {
                             agent { label params.BUILD_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_API == 'true' }
+                            }
                             steps { script { publishApp('api') } }
                         }
                         stage('Deploy API') {
                             agent { label params.DEPLOY_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_API == 'true' }
+                            }
                             steps { script { deployApp('api') } }
                         }
                     }
@@ -169,10 +187,18 @@ pipeline {
                         }
                         stage('Publish SSO') {
                             agent { label params.BUILD_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_SSO == 'true' }
+                            }
                             steps { script { publishApp('sso') } }
                         }
                         stage('Deploy SSO') {
                             agent { label params.DEPLOY_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_SSO == 'true' }
+                            }
                             steps { script { deployApp('sso') } }
                         }
                     }
@@ -187,10 +213,18 @@ pipeline {
                         }
                         stage('Publish SVC') {
                             agent { label params.BUILD_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_SVC == 'true' }
+                            }
                             steps { script { publishApp('svc') } }
                         }
                         stage('Deploy SVC') {
                             agent { label params.DEPLOY_AGENT_LABEL }
+                            when {
+                                beforeAgent true
+                                expression { env.DEPLOY_SVC == 'true' }
+                            }
                             steps { script { deployApp('svc') } }
                         }
                     }
@@ -307,7 +341,9 @@ def detectChanges() {
                 echo "${sharedDir()}/ changed - redeploying every application."
             }
             apps.each { k, app ->
-                flags[k] = sharedChanged || changed.any { it.startsWith(app.dir + '/') }
+                def own  = changed.findAll { it.startsWith(app.dir + '/') }
+                flags[k] = sharedChanged || !own.isEmpty()
+                env."CHANGED_${k.toUpperCase()}" = summariseChanges(own, sharedChanged, app.dir, sharedDir())
             }
         }
     }
@@ -319,6 +355,45 @@ def detectChanges() {
     env.DEPLOY_ANY = flags.any { k, v -> v }.toString()
 
     echo "Deploy plan: ${deploySummary()}"
+    currentBuild.description = "${env.TARGET_BRANCH}: ${deploySummary()}"
+}
+
+// One line explaining why an application is in the deploy plan. @NonCPS for the
+// list work, so the directory names are passed in rather than looked up here.
+@NonCPS
+def summariseChanges(List own, boolean sharedChanged, String appDir, String shared) {
+    def parts = []
+    if (own) { parts << "${own.size()} file(s) under '${appDir}/'" }
+    if (sharedChanged) { parts << "a change in ${shared}/ (shared by every application)" }
+    return parts ? parts.join(' + ') : 'no direct change'
+}
+
+// ---------------------------------------------------------------------------
+// Deploy settings are read here, on the build agent, and parked in env: the
+// approval runs on `agent none`, where resolveSetting has no workspace to read
+// jenkins/deploy-targets.properties from.
+// ---------------------------------------------------------------------------
+def captureDeploySettings() {
+    appCatalog().each { k, app ->
+        def K = k.toUpperCase()
+        if (env."DEPLOY_${K}" != 'true') { return }
+
+        env."TARGET_${K}" = resolveSetting("${app.key}_DEPLOY_PATH") ?: ''
+
+        def kept = [resolveSetting("${app.key}_EXCLUDE_FILES", app.excludeFiles),
+                    resolveSetting("${app.key}_EXCLUDE_DIRS",  app.excludeDirs)]
+                   .findAll { it?.trim() }.join(', ')
+        env."KEPT_${K}" = kept ?: 'nothing - the target is mirrored exactly'
+
+        if (k == 'svc') { env.SERVICE_SVC = resolveSetting("${app.key}_SERVICE_NAME", '') ?: '' }
+    }
+}
+
+// Commit facts for the approval prompt. Read on the agent, where git lives.
+def captureCommitInfo() {
+    env.COMMIT_SHORT   = runCmdOutput('git rev-parse --short HEAD')
+    env.COMMIT_AUTHOR  = runCmdOutput('git log -1 --pretty=format:%an')
+    env.COMMIT_SUBJECT = runCmdOutput('git log -1 --pretty=format:%s')
 }
 
 // Trimmed, non-empty lines. Kept @NonCPS: the CPS transformer does not support
@@ -355,7 +430,8 @@ def deploySummary() {
 // none` so a waiting approval does not occupy an executor.
 // ---------------------------------------------------------------------------
 def approveApp(String key) {
-    def app = appCatalog()[key]
+    def app  = appCatalog()[key]
+    def flag = "DEPLOY_${key.toUpperCase()}"
 
     if ((env.REQUIRE_APPROVAL ?: 'true').toLowerCase() == 'false') {
         echo "REQUIRE_APPROVAL=false - deploying ${app.name} without a manual gate."
@@ -365,15 +441,144 @@ def approveApp(String key) {
     def approvers = (env.CD_APPROVERS ?: '').trim()
     def waitMins  = (env.APPROVAL_TIMEOUT_MINUTES ?: '60') as Integer
 
-    timeout(time: waitMins, unit: 'MINUTES') {
-        def approver = input(
-            message: "Deploy ${app.name} to '${env.TARGET_BRANCH}'?",
-            ok: 'Deploy',
-            submitter: approvers ?: null,
-            submitterParameter: 'APPROVER'
-        )
-        echo "${app.name} approved by ${approver}."
+    // The console gets the full block: monospaced, never truncated, and still
+    // readable months later in the build log. The dialog gets the same facts in
+    // a shape that survives however Jenkins decides to render the message.
+    echo approvalReport(key, app, waitMins, approvers)
+
+    try {
+        def answer = null
+        timeout(time: waitMins, unit: 'MINUTES') {
+            answer = input(
+                message: approvalPrompt(key, app),
+                ok: "Deploy ${app.name}",
+                submitter: approvers ?: null,
+                submitterParameter: 'APPROVER',
+                parameters: [
+                    choice(
+                        name: 'ACTION',
+                        choices: ['Deploy', 'Skip this application'],
+                        description: "Deploy publishes ${app.name} and mirrors it onto the target listed above. " +
+                                     'Skip leaves that server untouched and lets the other applications carry on.'
+                    ),
+                    string(
+                        name: 'NOTE',
+                        defaultValue: '',
+                        description: 'Ticket or reason (optional). Recorded in the build log next to your name.'
+                    )
+                ]
+            )
+        }
+
+        def who  = answer.APPROVER ?: 'an unidentified user'
+        def note = (answer.NOTE ?: '').trim()
+        def why  = note ? " - ${note}" : ''
+
+        if (answer.ACTION == 'Deploy') {
+            echo "APPROVED  ${app.name} -> ${env.TARGET_BRANCH} by ${who}${why}"
+            noteOnBuild("${app.name}: approved by ${who}")
+        } else {
+            // A skip is a decision, not a failure: drop this lane, leave the
+            // rest of the build alone.
+            env."${flag}" = 'false'
+            echo "SKIPPED   ${app.name} - ${who} chose not to deploy it${why}. Nothing was published; the server was not touched."
+            noteOnBuild("${app.name}: skipped by ${who}")
+        }
     }
+    catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
+        def kind = interruptionKind(e)
+        // Someone cancelled the whole build - that is not this lane's decision.
+        if (kind == 'aborted') { throw e }
+
+        env."${flag}" = 'false'
+        if (kind == 'timeout') {
+            echo "TIMED OUT ${app.name} - nobody answered within ${waitMins} minute(s). Not deployed."
+            noteOnBuild("${app.name}: timed out")
+        } else {
+            echo "DECLINED  ${app.name} - the approval was rejected. Not deployed."
+            noteOnBuild("${app.name}: declined")
+        }
+        // Mark the stage, not the build: three approved applications should not
+        // go red because the fourth was turned down.
+        catchError(buildResult: 'SUCCESS', stageResult: 'NOT_BUILT') {
+            error("${app.name} was not approved.")
+        }
+    }
+}
+
+// Rejection, timeout and a cancelled build all arrive as FlowInterruptedException;
+// only the causes tell them apart. Matched on class name so a plugin upgrade that
+// relocates the class cannot break the pipeline.
+@NonCPS
+def interruptionKind(Throwable e) {
+    def names = e.causes.collect { it.getClass().getName() }
+    if (names.any { it.endsWith('Rejection') })       { return 'rejected' }
+    if (names.any { it.contains('ExceededTimeout') }) { return 'timeout' }
+    return 'aborted'
+}
+
+// Compact form for the input dialog. Written as leading-dash lines so it reads
+// correctly whether Jenkins keeps the newlines or folds them into one line.
+def approvalPrompt(String key, Map app) {
+    def K = key.toUpperCase()
+    def target  = env."TARGET_${K}"
+    def changed = env."CHANGED_${K}"
+    def kept    = env."KEPT_${K}"
+
+    def out = "Deploy ${app.name} to '${env.TARGET_BRANCH}'?"
+    out += "\n- commit ${env.COMMIT_SHORT ?: '?'} by ${env.COMMIT_AUTHOR ?: '?'}: ${env.COMMIT_SUBJECT ?: ''}"
+    out += "\n- why: ${changed ?: 'forced deployment (APPLICATION parameter)'}"
+    out += "\n- target: ${target ?: 'NOT CONFIGURED - this deploy will fail, see JENKINS.md'}"
+    out += "\n- kept on the server: ${kept ?: '-'}"
+    if (key == 'svc' && env.SERVICE_SVC) { out += "\n- service stopped and restarted: ${env.SERVICE_SVC}" }
+    out += "\n- build #${env.BUILD_NUMBER}"
+    return out
+}
+
+// Full form for the console log.
+def approvalReport(String key, Map app, int waitMins, String approvers) {
+    def K = key.toUpperCase()
+    def target  = env."TARGET_${K}"  ?: 'NOT CONFIGURED - this deploy will fail, see JENKINS.md'
+    def changed = env."CHANGED_${K}" ?: 'forced deployment (APPLICATION parameter)'
+    def kept    = env."KEPT_${K}"    ?: '-'
+
+    def rows = []
+    rows << "application   ${app.name}"
+    rows << "branch        ${env.TARGET_BRANCH}"
+    rows << "build         #${env.BUILD_NUMBER}"
+    rows << "commit        ${env.COMMIT_SHORT ?: '?'}  ${env.COMMIT_SUBJECT ?: ''}"
+    rows << "author        ${env.COMMIT_AUTHOR ?: '?'}"
+    rows << "why           ${changed}"
+    rows << "publishes     ${app.project}"
+    rows << "target        ${target}"
+    rows << "kept          ${kept}"
+    if (key == 'svc' && env.SERVICE_SVC) { rows << "service       ${env.SERVICE_SVC} (stopped for the copy, restarted after)" }
+    rows << "approvers     ${approvers ?: 'ANYONE who can see this build - set CD_APPROVERS to restrict'}"
+    rows << "expires       in ${waitMins} minute(s), after which the application is skipped"
+    rows << "decide at     ${env.BUILD_URL ?: ''}input"
+
+    return renderBox("APPROVAL REQUIRED: ${app.name} -> ${env.TARGET_BRANCH}", rows)
+}
+
+// A plain-ASCII box: @NonCPS to keep the list and string work out of the CPS
+// interpreter, ASCII-only so it survives any console encoding.
+@NonCPS
+def renderBox(String title, List rows) {
+    def width = ([title.length()] + rows.collect { it.length() }).max() + 2
+    def rule  = '+' + ('-' * width) + '+'
+    def out   = new StringBuilder('\n' + rule + '\n')
+    out << '| ' << title.padRight(width - 1) << '|\n'
+    out << rule << '\n'
+    rows.each { out << '| ' << it.padRight(width - 1) << '|\n' }
+    out << rule
+    return out.toString()
+}
+
+// Decisions accumulate on the build page, so the build list shows who agreed to
+// what without anyone having to open the log.
+def noteOnBuild(String text) {
+    def current = (currentBuild.description ?: '').trim()
+    currentBuild.description = current ? "${current} | ${text}" : text
 }
 
 // ---------------------------------------------------------------------------
