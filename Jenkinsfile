@@ -411,6 +411,11 @@ def summariseChanges(List own, boolean sharedChanged, String appDir, String shar
 // jenkins/deploy-targets.properties from.
 // ---------------------------------------------------------------------------
 def captureDeploySettings() {
+    // Automatic deploy, or wait for a human? One flag for the whole branch,
+    // resolved here because the approval itself runs on `agent none` and cannot
+    // read jenkins/deploy-targets.properties.
+    env.APPROVAL_REQUIRED = resolveSetting('REQUIRE_APPROVAL', 'true')
+
     appCatalog().each { k, app ->
         def K = k.toUpperCase()
         if (env."DEPLOY_${K}" != 'true') { return }
@@ -424,6 +429,12 @@ def captureDeploySettings() {
 
         if (k == 'svc') { env.SERVICE_SVC = resolveSetting("${app.key}_SERVICE_NAME", '') ?: '' }
     }
+}
+
+// Gated unless something explicitly says false, so a typo, an empty value or a
+// missing entry leaves the approval in place rather than removing it.
+def approvalRequired() {
+    return (env.APPROVAL_REQUIRED ?: 'true').trim().toLowerCase() != 'false'
 }
 
 // Commit facts for the approval prompt. Read on the agent, where git lives.
@@ -478,8 +489,9 @@ def approveAll() {
     apps.each { k, app -> if (env."DEPLOY_${k.toUpperCase()}" == 'true') { planned << k } }
     if (!planned) { return }
 
-    if ((env.REQUIRE_APPROVAL ?: 'true').toLowerCase() == 'false') {
-        echo 'REQUIRE_APPROVAL=false - deploying the whole plan without a manual gate.'
+    if (!approvalRequired()) {
+        echo "AUTOMATIC REQUIRE_APPROVAL=false for '${env.TARGET_BRANCH}' - deploying ${deploySummary()} without a gate."
+        for (k in planned) { noteOnBuild("${apps[k].name}: automatic") }
         return
     }
 
@@ -616,8 +628,9 @@ def approveApp(String key) {
     def app  = appCatalog()[key]
     def flag = "DEPLOY_${key.toUpperCase()}"
 
-    if ((env.REQUIRE_APPROVAL ?: 'true').toLowerCase() == 'false') {
-        echo "REQUIRE_APPROVAL=false - deploying ${app.name} without a manual gate."
+    if (!approvalRequired()) {
+        echo "AUTOMATIC REQUIRE_APPROVAL=false for '${env.TARGET_BRANCH}' - deploying ${app.name} without a gate."
+        noteOnBuild("${app.name}: automatic")
         return
     }
 
