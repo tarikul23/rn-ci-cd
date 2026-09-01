@@ -29,19 +29,21 @@ pipeline {
         timeout(time: 4, unit: 'HOURS')
     }
 
-    // Every push builds this branch.
-    //   githubPush  fires the moment GitHub delivers a webhook. Needs Jenkins to
-    //               be reachable from github.com - see JENKINS.md.
-    //   pollSCM     asks GitHub for new commits every ~2 minutes. This is what
-    //               actually works while Jenkins is only on localhost.
-    // Both are declared: whichever can reach the repo first starts the build,
-    // and Jenkins will not run the same commit twice.
+    // Push-driven only: a build starts when GitHub delivers a push webhook for
+    // this branch. Nothing runs on a timer, so no commit is ever built twice
+    // and idle branches cost nothing.
+    //
+    // REQUIRES Jenkins to be reachable from github.com:
+    //   - the repo's webhook points at <JENKINS_URL>/github-webhook/
+    //   - JENKINS_URL is the address GitHub can actually resolve, not localhost
+    //     (use a tunnel such as ngrok while developing) - see JENKINS.md.
+    // If the webhook cannot be delivered, the job simply never starts by itself.
     //
     // NOTE: a declarative `triggers` block is registered when the job runs, so
-    // build the job once by hand after adding it - only then does it self-start.
+    // build the job once by hand after changing it - only then does the new
+    // trigger take effect and the old Poll SCM schedule disappear from the job.
     triggers {
         githubPush()
-        pollSCM('H/2 * * * *')
     }
 
     parameters {
@@ -327,10 +329,17 @@ def splitLines(String text) {
 }
 
 // Previous successful build's commit if Jenkins knows it, else the first parent.
+//
+// The revision is single-quoted, and that is not cosmetic: PowerShell reads a
+// bare {commit} as a script block, and for a native command it expands one into
+// `-encodedCommand <base64> -inputFormat xml -outputFormat text`. git then
+// unpacks -encodedCommand as a cluster of short flags and fails with
+// "unknown switch `n'" - so every rev spelled with ^{commit} must be quoted.
 def resolveDiffBase() {
     def candidates = [env.GIT_PREVIOUS_SUCCESSFUL_COMMIT, 'HEAD^'].findAll { it }
     for (c in candidates) {
-        if (runCmdStatus("git cat-file -e ${c}^{commit}") == 0) { return c }
+        // --verify --quiet: no usage banner on stderr for a rev that is absent.
+        if (runCmdStatus("git rev-parse --verify --quiet '${c}^{commit}'") == 0) { return c }
     }
     return null
 }
