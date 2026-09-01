@@ -446,6 +446,8 @@ def approveApp(String key) {
     // a shape that survives however Jenkins decides to render the message.
     echo approvalReport(key, app, waitMins, approvers)
 
+    def startedAt = System.currentTimeMillis()
+
     try {
         def answer = null
         timeout(time: waitMins, unit: 'MINUTES') {
@@ -486,7 +488,7 @@ def approveApp(String key) {
         }
     }
     catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException e) {
-        def kind = interruptionKind(e)
+        def kind = interruptionKind(e, System.currentTimeMillis() - startedAt, waitMins)
         // Someone cancelled the whole build - that is not this lane's decision.
         if (kind == 'aborted') { throw e }
 
@@ -506,14 +508,25 @@ def approveApp(String key) {
     }
 }
 
-// Rejection, timeout and a cancelled build all arrive as FlowInterruptedException;
-// only the causes tell them apart. Matched on class name so a plugin upgrade that
-// relocates the class cannot break the pipeline.
+// Rejection, timeout and a cancelled build all arrive as FlowInterruptedException
+// and have to be told apart. getCauses() would be the obvious way and is NOT on
+// the script-security whitelist; Throwable.getMessage() is, and
+// FlowInterruptedException overrides it with the causes' short descriptions:
+//
+//   "Rejected by <user>" / "Rejected"   Abort pressed in the input dialog
+//   "Timeout has been exceeded"         the timeout step around it fired
+//   "Aborted by <user>"                 someone stopped the whole build
+//
+// Those strings come from a localised message bundle, so elapsed time is used as
+// a language-independent second opinion on the timeout, and anything still
+// unrecognised is treated as a build abort - the safe direction to be wrong in,
+// since an abort is rethrown rather than swallowed.
 @NonCPS
-def interruptionKind(Throwable e) {
-    def names = e.causes.collect { it.getClass().getName() }
-    if (names.any { it.endsWith('Rejection') })       { return 'rejected' }
-    if (names.any { it.contains('ExceededTimeout') }) { return 'timeout' }
+def interruptionKind(Throwable e, long elapsedMs, int waitMins) {
+    def msg = e.getMessage() ?: ''
+    if (msg.startsWith('Rejected')) { return 'rejected' }
+    if (msg.startsWith('Timeout'))  { return 'timeout' }
+    if (elapsedMs >= (waitMins * 60000L) - 5000L) { return 'timeout' }
     return 'aborted'
 }
 
@@ -557,21 +570,27 @@ def approvalReport(String key, Map app, int waitMins, String approvers) {
     rows << "expires       in ${waitMins} minute(s), after which the application is skipped"
     rows << "decide at     ${env.BUILD_URL ?: ''}input"
 
-    return renderBox("APPROVAL REQUIRED: ${app.name} -> ${env.TARGET_BRANCH}", rows)
+    return renderBanner("APPROVAL REQUIRED: ${app.name} -> ${env.TARGET_BRANCH}", rows)
 }
 
-// A plain-ASCII box: @NonCPS to keep the list and string work out of the CPS
-// interpreter, ASCII-only so it survives any console encoding.
+// Plain-ASCII banner, ASCII-only so it survives any console encoding.
+//
+// Built from nothing but string concatenation and List.join, because the Groovy
+// sandbox is narrower than it looks. Neither of these is whitelisted:
+//
+//   list.max()          only max(Collection, Closure) is - the bare form threw
+//                       RejectedAccessException on the first run
+//   stringBuilder << x  only leftShift on StringBuffer/String/Collection is
+//
+// The rows arrive already column-aligned from approvalReport, so there is also
+// nothing here to measure or pad.
 @NonCPS
-def renderBox(String title, List rows) {
-    def width = ([title.length()] + rows.collect { it.length() }).max() + 2
-    def rule  = '+' + ('-' * width) + '+'
-    def out   = new StringBuilder('\n' + rule + '\n')
-    out << '| ' << title.padRight(width - 1) << '|\n'
-    out << rule << '\n'
-    rows.each { out << '| ' << it.padRight(width - 1) << '|\n' }
-    out << rule
-    return out.toString()
+def renderBanner(String title, List rows) {
+    def rule  = '-' * 78
+    def lines = ['', rule, title, rule]
+    for (r in rows) { lines << '  ' + r }
+    lines << rule
+    return lines.join('\n')
 }
 
 // Decisions accumulate on the build page, so the build list shows who agreed to
